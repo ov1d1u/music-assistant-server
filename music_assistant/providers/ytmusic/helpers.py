@@ -221,7 +221,7 @@ async def add_remove_playlist_tracks(
 
 
 async def get_song_radio_tracks(
-    headers: dict[str, str], prov_item_id: str, limit=25
+    headers: dict[str, str], prov_item_id: str, limit=25, exclude_videos=False
 ) -> dict[str, str]:
     """Async wrapper around the ytmusicapi radio function."""
 
@@ -231,9 +231,11 @@ async def get_song_radio_tracks(
         result = ytm.get_watch_playlist(
             videoId=prov_item_id, playlistId=playlist_id, limit=limit, radio=True
         )
+        tracks = result["tracks"]
+        if exclude_videos:
+            music_video_types = ["MUSIC_VIDEO_TYPE_ATV", "OFFICIAL_SOURCE_MUSIC"]
+            tracks = [ t for t in tracks if t["videoType"] in music_video_types ]
         # Replace inconsistensies for easier parsing
-        music_video_types = ["MUSIC_VIDEO_TYPE_ATV", "OFFICIAL_SOURCE_MUSIC"]
-        tracks = [ t for t in result["tracks"] if t["videoType"] in music_video_types ]
         for track in tracks:
             if track.get("thumbnail"):
                 track["thumbnails"] = track["thumbnail"]
@@ -246,15 +248,20 @@ async def get_song_radio_tracks(
 
 
 async def search(
-    query: str, ytm_filter: str | None = None, limit: int = 20, language: str = "en"
+    query: str,
+    ytm_filter: str | None = None,
+    limit: int = 20,
+    language: str = "en",
+    exclude_videos: bool = False
 ) -> list[dict]:
     """Async wrapper around the ytmusicapi search function."""
 
     def _search():
         ytm = ytmusicapi.YTMusic(language=language)
         results = ytm.search(query=query, filter=ytm_filter, limit=limit)
+        if exclude_videos:
+            results = [ result for result in results if result["resultType"] != "video" ]
         # Sync result properties with uniformal objects
-        results = [ result for result in results if result["resultType"] != "video" ]
         for result in results:
             if result["resultType"] == "artist":
                 if "artists" in result and len(result["artists"]) > 0:
