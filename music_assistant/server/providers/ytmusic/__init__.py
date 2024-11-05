@@ -73,6 +73,7 @@ CONF_AUTH_TOKEN = "auth_token"
 CONF_REFRESH_TOKEN = "refresh_token"
 CONF_TOKEN_TYPE = "token_type"
 CONF_EXPIRY_TIME = "expiry_time"
+CONF_EXCLUDE_VIDEOS = "exclude_videos"
 
 YTM_DOMAIN = "https://music.youtube.com"
 YTM_BASE_URL = f"{YTM_DOMAIN}/youtubei/v1/"
@@ -174,6 +175,13 @@ async def get_config_entries(
             label="The token type required to create headers",
             hidden=True,
             value=values.get(CONF_TOKEN_TYPE) if values else None,
+        ),
+        ConfigEntry(
+            key=CONF_EXCLUDE_VIDEOS,
+            type=ConfigEntryType.BOOLEAN,
+            label="Exclude videos from search & radio",
+            required=True,
+            default_value=False,
         ),
     )
 
@@ -503,6 +511,7 @@ class YoutubeMusicProvider(MusicProvider):
             headers=self._headers,
             prov_item_id=prov_track_id,
             limit=limit,
+            exclude_videos=self.config.get_value(CONF_EXCLUDE_VIDEOS)
         )
         if "tracks" in result:
             tracks = []
