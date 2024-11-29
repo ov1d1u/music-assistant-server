@@ -5,7 +5,7 @@ on:
     types: [published]
 
 env:
-  PYTHON_VERSION: "3.11"
+  PYTHON_VERSION: "3.12"
   BASE_IMAGE_VERSION_STABLE: "1.1.2"
   BASE_IMAGE_VERSION_BETA: "1.1.2"
 
@@ -76,7 +76,7 @@ jobs:
           path: dist/
       - name: Publish release to PyPI
         if: ${{ github.event.release.prerelease == false }}
-        uses: pypa/gh-action-pypi-publish@v1.11.0
+        uses: pypa/gh-action-pypi-publish@v1.12.2
         with:
           user: __token__
           password: ${{ secrets.PYPI_TOKEN }}

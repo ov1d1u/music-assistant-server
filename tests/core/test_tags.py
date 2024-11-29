@@ -4,7 +4,7 @@ import pathlib
 
 from music_assistant.helpers import tags
 
-RESOURCES_DIR = pathlib.Path(__file__).parent.resolve().joinpath("fixtures")
+RESOURCES_DIR = pathlib.Path(__file__).parent.parent.resolve().joinpath("fixtures")
 
 FILE_1 = str(RESOURCES_DIR.joinpath("MyArtist - MyTitle.mp3"))
 

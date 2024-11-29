@@ -15,7 +15,7 @@ from music_assistant import MusicAssistant
 def _get_fixture_folder(provider: str | None = None) -> pathlib.Path:
     tests_base = pathlib.Path(__file__).parent
     if provider:
-        return tests_base / "server" / "providers" / provider / "fixtures"
+        return tests_base / "providers" / provider / "fixtures"
     return tests_base / "fixtures"
 
 

@@ -26,7 +26,9 @@ async def jellyfin_provider(mass: MusicAssistant) -> AsyncGenerator[ProviderConf
 
     authenticate_by_name = f.to_authenticate_by_name()
 
-    with mock.patch(".providers.jellyfin.authenticate_by_name", authenticate_by_name):
+    with mock.patch(
+        "music_assistant.providers.jellyfin.authenticate_by_name", authenticate_by_name
+    ):
         async with wait_for_sync_completion(mass):
             config = await mass.config.save_provider_config(
                 "jellyfin",

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Setups the repository.
+
+# Set-up the development environment
 
 # Stop on errors
 set -e
