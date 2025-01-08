@@ -149,7 +149,7 @@ class SMBFileSystemProvider(LocalFileSystemProvider):
 
         await self.check_write_access()
 
-    async def unload(self) -> None:
+    async def unload(self, is_removed: bool = False) -> None:
         """
         Handle unload/close of the provider.
 

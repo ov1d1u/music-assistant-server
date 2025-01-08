@@ -266,7 +266,7 @@ class SlimprotoProvider(PlayerProvider):
             "/slimproto/multi", self._serve_multi_client_stream
         )
 
-    async def unload(self) -> None:
+    async def unload(self, is_removed: bool = False) -> None:
         """Handle close/cleanup of the provider."""
         self.mass.streams.unregister_dynamic_route("/slimproto/multi")
         await self.slimproto.stop()

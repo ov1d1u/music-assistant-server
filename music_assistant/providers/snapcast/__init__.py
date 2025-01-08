@@ -332,7 +332,7 @@ class SnapCastProvider(PlayerProvider):
         # initial load of players
         self._handle_update()
 
-    async def unload(self) -> None:
+    async def unload(self, is_removed: bool = False) -> None:
         """Handle close/cleanup of the provider."""
         self._stop_called = True
         for snap_client_id in self._snapserver.clients:

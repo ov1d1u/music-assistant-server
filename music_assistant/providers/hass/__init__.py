@@ -185,7 +185,7 @@ class HomeAssistant(PluginProvider):
             raise SetupFailedError(err_msg) from err
         self._listen_task = self.mass.create_task(self._hass_listener())
 
-    async def unload(self) -> None:
+    async def unload(self, is_removed: bool = False) -> None:
         """
         Handle unload/close of the provider.
 

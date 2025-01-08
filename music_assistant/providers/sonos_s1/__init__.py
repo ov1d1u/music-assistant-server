@@ -155,7 +155,7 @@ class SonosPlayerProvider(PlayerProvider):
         self.creation_lock = asyncio.Lock()
         self._known_invisible: set[SoCo] = set()
 
-    async def unload(self) -> None:
+    async def unload(self, is_removed: bool = False) -> None:
         """Handle close/cleanup of the provider."""
         if self._discovery_reschedule_timer:
             self._discovery_reschedule_timer.cancel()

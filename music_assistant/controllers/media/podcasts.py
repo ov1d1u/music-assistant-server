@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.enums import MediaType, ProviderFeature
 from music_assistant_models.errors import InvalidDataError
-from music_assistant_models.media_items import Artist, Episode, Podcast, UniqueList
+from music_assistant_models.media_items import (
+    Artist,
+    Podcast,
+    PodcastEpisode,
+    UniqueList,
+)
 
-from music_assistant.constants import DB_TABLE_PODCASTS
+from music_assistant.constants import DB_TABLE_PLAYLOG, DB_TABLE_PODCASTS
 from music_assistant.controllers.media.base import MediaControllerBase
 from music_assistant.helpers.compare import (
     compare_media_item,
@@ -50,6 +56,7 @@ class PodcastsController(MediaControllerBase[Podcast]):
         # register (extra) api handlers
         api_base = self.api_base
         self.mass.register_api_command(f"music/{api_base}/podcast_episodes", self.episodes)
+        self.mass.register_api_command(f"music/{api_base}/podcast_episode", self.episode)
         self.mass.register_api_command(f"music/{api_base}/podcast_versions", self.versions)
 
     async def library_items(
@@ -97,22 +104,33 @@ class PodcastsController(MediaControllerBase[Podcast]):
         self,
         item_id: str,
         provider_instance_id_or_domain: str,
-    ) -> UniqueList[Episode]:
+    ) -> UniqueList[PodcastEpisode]:
         """Return podcast episodes for the given provider podcast id."""
         # always check if we have a library item for this podcast
-        library_podcast = await self.get_library_item_by_prov_id(
+        if library_podcast := await self.get_library_item_by_prov_id(
+            item_id, provider_instance_id_or_domain
+        ):
+            # return items from first/only provider
+            for provider_mapping in library_podcast.provider_mappings:
+                episodes = await self._get_provider_podcast_episodes(
+                    provider_mapping.item_id, provider_mapping.provider_instance
+                )
+                return sorted(episodes, key=lambda x: x.position)
+        episodes = await self._get_provider_podcast_episodes(
             item_id, provider_instance_id_or_domain
         )
-        if not library_podcast:
-            return await self._get_provider_podcast_episodes(
-                item_id, provider_instance_id_or_domain
-            )
-        # return items from first/only provider
-        for provider_mapping in library_podcast.provider_mappings:
-            return await self._get_provider_podcast_episodes(
-                provider_mapping.item_id, provider_mapping.provider_instance
-            )
-        return UniqueList()
+        return sorted(episodes, key=lambda x: x.position)
+
+    async def episode(
+        self,
+        item_id: str,
+        provider_instance_id_or_domain: str,
+    ) -> UniqueList[PodcastEpisode]:
+        """Return single podcast episode by the given provider podcast id."""
+        prov: MusicProvider = self.mass.get_provider(provider_instance_id_or_domain)
+        if not prov:
+            raise InvalidDataError("Provider not found")
+        return await prov.get_podcast_episode(item_id)
 
     async def versions(
         self,
@@ -197,46 +215,45 @@ class PodcastsController(MediaControllerBase[Podcast]):
 
     async def _get_provider_podcast_episodes(
         self, item_id: str, provider_instance_id_or_domain: str
-    ) -> list[Episode]:
+    ) -> list[PodcastEpisode]:
         """Return podcast episodes for the given provider podcast id."""
         prov: MusicProvider = self.mass.get_provider(provider_instance_id_or_domain)
         if prov is None:
             return []
-        # prefer cache items (if any) - for streaming providers only
-        cache_base_key = prov.lookup_key
-        cache_key = f"podcast.{item_id}"
-        if (
-            prov.is_streaming_provider
-            and (cache := await self.mass.cache.get(cache_key, base_key=cache_base_key)) is not None
-        ):
-            return [Episode.from_dict(x) for x in cache]
-        # no items in cache - get listing from provider
+        # grab the episodes from the provider
+        # note that we do not cache any of this because its
+        # always a rather small list and we want fresh resume info
         items = await prov.get_podcast_episodes(item_id)
-        # store (serializable items) in cache
-        if prov.is_streaming_provider:
-            self.mass.create_task(
-                self.mass.cache.set(
-                    cache_key,
-                    [x.to_dict() for x in items],
-                    expiration=3600,
-                    base_key=cache_base_key,
-                ),
-            )
 
+        async def set_resume_position(episode: PodcastEpisode) -> None:
+            if episode.fully_played is not None or episode.resume_position_ms:
+                return
+            # TODO: inject resume position info here for providers that do not natively provide it
+            resume_info_db_row = await self.mass.music.database.get_row(
+                DB_TABLE_PLAYLOG,
+                {
+                    "item_id": episode.item_id,
+                    "provider": prov.lookup_key,
+                    "media_type": MediaType.PODCAST_EPISODE,
+                },
+            )
+            if resume_info_db_row is None:
+                return
+            if resume_info_db_row["seconds_played"]:
+                episode.resume_position_ms = int(resume_info_db_row["seconds_played"] * 1000)
+            if resume_info_db_row["fully_played"] is not None:
+                episode.fully_played = resume_info_db_row["fully_played"]
+
+        await asyncio.gather(*[set_resume_position(x) for x in items])
         return items
 
-    async def _get_provider_dynamic_base_tracks(
+    async def radio_mode_base_tracks(
         self,
         item_id: str,
         provider_instance_id_or_domain: str,
         limit: int = 25,
     ) -> list[Track]:
         """Get the list of base tracks from the controller used to calculate the dynamic radio."""
-        msg = "Dynamic tracks not supported for Podcast MediaItem"
-        raise NotImplementedError(msg)
-
-    async def _get_dynamic_tracks(self, media_item: Podcast, limit: int = 25) -> list[Track]:
-        """Get dynamic list of tracks for given item, fallback/default implementation."""
         msg = "Dynamic tracks not supported for Podcast MediaItem"
         raise NotImplementedError(msg)
 
@@ -250,7 +267,9 @@ class PodcastsController(MediaControllerBase[Podcast]):
 
         async def find_prov_match(provider: MusicProvider):
             self.logger.debug(
-                "Trying to match podcast %s on provider %s", db_podcast.name, provider.name
+                "Trying to match podcast %s on provider %s",
+                db_podcast.name,
+                provider.name,
             )
             match_found = False
             search_str = db_podcast.name

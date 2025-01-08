@@ -165,7 +165,7 @@ class SonosPlayer:
             )
         )
 
-    async def unload(self) -> None:
+    async def unload(self, is_removed: bool = False) -> None:
         """Unload the player (disconnect + cleanup)."""
         await self._disconnect()
         self.mass.players.remove(self.player_id, False)

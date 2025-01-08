@@ -20,7 +20,12 @@ from music_assistant_models.enums import (
     ProviderFeature,
     StreamType,
 )
-from music_assistant_models.errors import LoginFailed, MediaNotFoundError, ProviderPermissionDenied
+from music_assistant_models.errors import (
+    LoginFailed,
+    MediaNotFoundError,
+    ProviderPermissionDenied,
+    UnsupportedFeaturedException,
+)
 from music_assistant_models.media_items import (
     Album,
     Artist,
@@ -28,6 +33,8 @@ from music_assistant_models.media_items import (
     ItemMapping,
     MediaItemImage,
     Playlist,
+    Podcast,
+    PodcastEpisode,
     ProviderMapping,
     SearchResults,
     Track,
@@ -51,6 +58,8 @@ if TYPE_CHECKING:
     from libopensonic.media import Artist as SonicArtist
     from libopensonic.media import ArtistInfo as SonicArtistInfo
     from libopensonic.media import Playlist as SonicPlaylist
+    from libopensonic.media import PodcastChannel as SonicPodcast
+    from libopensonic.media import PodcastEpisode as SonicEpisode
     from libopensonic.media import Song as SonicSong
 
 CONF_BASE_URL = "baseURL"
@@ -64,6 +73,12 @@ UNKNOWN_ARTIST_ID = "fake_artist_unknown"
 # tracks on Various Artists albums, see the note in the _parse_track() method and the handling
 # in get_artist()
 NAVI_VARIOUS_PREFIX = "MA-NAVIDROME-"
+
+
+# Because of some subsonic API weirdness, we have to lookup any podcast episode by finding it in
+# the list of episodes in a channel, to facilitate, we will use both the episode id and the
+# channel id concatenated as an episode id to MA
+EP_CHAN_SEP = "$!$"
 
 
 class OpenSonicProvider(MusicProvider):
@@ -130,6 +145,8 @@ class OpenSonicProvider(MusicProvider):
             ProviderFeature.SIMILAR_TRACKS,
             ProviderFeature.PLAYLIST_TRACKS_EDIT,
             ProviderFeature.PLAYLIST_CREATE,
+            ProviderFeature.LIBRARY_PODCASTS,
+            ProviderFeature.LIBRARY_PODCASTS_EDIT,
         }
 
     @property
@@ -392,6 +409,79 @@ class OpenSonicProvider(MusicProvider):
             ]
         return playlist
 
+    def _parse_podcast(self, sonic_podcast: SonicPodcast) -> Podcast:
+        podcast = Podcast(
+            item_id=sonic_podcast.id,
+            provider=self.domain,
+            name=sonic_podcast.title,
+            uri=sonic_podcast.url,
+            total_episodes=len(sonic_podcast.episodes),
+            provider_mappings={
+                ProviderMapping(
+                    item_id=sonic_podcast.id,
+                    provider_domain=self.domain,
+                    provider_instance=self.instance_id,
+                )
+            },
+        )
+
+        podcast.metadata.description = sonic_podcast.description
+        podcast.metadata.images = []
+
+        if sonic_podcast.cover_id:
+            podcast.metadata.images.append(
+                MediaItemImage(
+                    type=ImageType.THUMB,
+                    path=sonic_podcast.cover_id,
+                    provider=self.instance_id,
+                    remotely_accessible=False,
+                )
+            )
+
+        return podcast
+
+    def _parse_epsiode(
+        self, sonic_episode: SonicEpisode, sonic_channel: SonicPodcast
+    ) -> PodcastEpisode:
+        eid = f"{sonic_episode.channel_id}{EP_CHAN_SEP}{sonic_episode.id}"
+        pos = 1
+        for ep in sonic_channel.episodes:
+            if ep.id == sonic_episode.id:
+                break
+            pos += 1
+
+        episode = PodcastEpisode(
+            item_id=eid,
+            provider=self.domain,
+            name=sonic_episode.title,
+            position=pos,
+            podcast=self._parse_podcast(sonic_channel),
+            provider_mappings={
+                ProviderMapping(
+                    item_id=eid,
+                    provider_domain=self.domain,
+                    provider_instance=self.instance_id,
+                )
+            },
+            duration=sonic_episode.duration,
+        )
+
+        if sonic_episode.description:
+            episode.metadata.description = sonic_episode.description
+
+        return episode
+
+    async def _get_podcast_episode(self, eid: str) -> SonicEpisode:
+        chan_id, ep_id = eid.split(EP_CHAN_SEP)
+        chan = await self._run_async(self._conn.getPodcasts, incEpisodes=True, pid=chan_id)
+
+        for episode in chan[0].episodes:
+            if episode.id == ep_id:
+                return episode
+
+        msg = f"Can't find episode {ep_id} in podcast {chan_id}"
+        raise MediaNotFoundError(msg)
+
     async def _run_async(self, call: Callable, *args, **kwargs):
         return await self.mass.create_task(call, *args, **kwargs)
 
@@ -447,14 +537,20 @@ class OpenSonicProvider(MusicProvider):
         offset = 0
         size = 500
         albums = await self._run_async(
-            self._conn.getAlbumList2, ltype="alphabeticalByArtist", size=size, offset=offset
+            self._conn.getAlbumList2,
+            ltype="alphabeticalByArtist",
+            size=size,
+            offset=offset,
         )
         while albums:
             for album in albums:
                 yield self._parse_album(album)
             offset += size
             albums = await self._run_async(
-                self._conn.getAlbumList2, ltype="alphabeticalByArtist", size=size, offset=offset
+                self._conn.getAlbumList2,
+                ltype="alphabeticalByArtist",
+                size=size,
+                offset=offset,
             )
 
     async def get_library_playlists(self) -> AsyncGenerator[Playlist, None]:
@@ -578,7 +674,7 @@ class OpenSonicProvider(MusicProvider):
         except (ParameterError, DataNotFoundError) as e:
             msg = f"Item {prov_track_id} not found"
             raise MediaNotFoundError(msg) from e
-        album = await self._run_async(self.get_album, prov_ablum_id=sonic_song.parent)
+        album = await self._run_async(self.get_album, prov_album_id=sonic_song.parent)
         return self._parse_track(sonic_song, album=album)
 
     async def get_artist_albums(self, prov_artist_id: str) -> list[Album]:
@@ -606,6 +702,52 @@ class OpenSonicProvider(MusicProvider):
             msg = f"Playlist {prov_playlist_id} not found"
             raise MediaNotFoundError(msg) from e
         return self._parse_playlist(sonic_playlist)
+
+    async def get_podcast_episode(self, prov_episode_id: str) -> PodcastEpisode:
+        """Get (full) podcast episode details by id."""
+        podcast_id, _ = prov_episode_id.split(EP_CHAN_SEP)
+        for episode in await self.get_podcast_episodes(podcast_id):
+            if episode.item_id == prov_episode_id:
+                return episode
+        msg = f"Episode {prov_episode_id} not found"
+        raise MediaNotFoundError(msg)
+
+    async def get_podcast_episodes(
+        self,
+        prov_podcast_id: str,
+    ) -> list[PodcastEpisode]:
+        """Get all Episodes for given podcast id."""
+        if not self._enable_podcasts:
+            return []
+
+        channels = await self._run_async(
+            self._conn.getPodcasts, incEpisodes=True, pid=prov_podcast_id
+        )
+
+        channel = channels[0]
+        episodes = []
+        for episode in channel.episodes:
+            episodes.append(self._parse_epsiode(episode, channel))
+        return episodes
+
+    async def get_podcast(self, prov_podcast_id: str) -> Podcast:
+        """Get full Podcast details by id."""
+        if not self._enable_podcasts:
+            return None
+
+        channels = await self._run_async(
+            self._conn.getPodcasts, incEpisodes=True, pid=prov_podcast_id
+        )
+
+        return self._parse_podcast(channels[0])
+
+    async def get_library_podcasts(self) -> AsyncGenerator[Podcast, None]:
+        """Retrieve library/subscribed podcasts from the provider."""
+        if self._enable_podcasts:
+            channels = await self._run_async(self._conn.getPodcasts, incEpisodes=True)
+
+            for channel in channels:
+                yield self._parse_podcast(channel)
 
     async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
         """Get playlist tracks."""
@@ -670,7 +812,9 @@ class OpenSonicProvider(MusicProvider):
         """
         try:
             await self._run_async(
-                self._conn.updatePlaylist, lid=prov_playlist_id, songIdsToAdd=prov_track_ids
+                self._conn.updatePlaylist,
+                lid=prov_playlist_id,
+                songIdsToAdd=prov_track_ids,
             )
         except SonicError as ex:
             msg = f"Failed to add songs to {prov_playlist_id}, check your permissions."
@@ -695,39 +839,58 @@ class OpenSonicProvider(MusicProvider):
         self, item_id: str, media_type: MediaType = MediaType.TRACK
     ) -> StreamDetails:
         """Get the details needed to process a specified track."""
-        try:
-            sonic_song: SonicSong = await self._run_async(self._conn.getSong, item_id)
-        except (ParameterError, DataNotFoundError) as e:
-            msg = f"Item {item_id} not found"
-            raise MediaNotFoundError(msg) from e
+        if media_type == MediaType.TRACK:
+            try:
+                item: SonicSong = await self._run_async(self._conn.getSong, item_id)
+            except (ParameterError, DataNotFoundError) as e:
+                msg = f"Item {item_id} not found"
+                raise MediaNotFoundError(msg) from e
 
-        self.mass.create_task(self._report_playback_started(item_id))
+            self.logger.debug(
+                "Fetching stream details for id %s '%s' with format '%s'",
+                item.id,
+                item.title,
+                item.content_type,
+            )
 
-        mime_type = sonic_song.content_type
+            self.mass.create_task(self._report_playback_started(item_id))
+        elif media_type == MediaType.PODCAST_EPISODE:
+            item: SonicEpisode = await self._get_podcast_episode(item_id)
+
+            self.logger.debug(
+                "Fetching stream details for podcast episode '%s' with format '%s'",
+                item.id,
+                item.content_type,
+            )
+            self.mass.create_task(self._report_playback_started(item.id))
+        else:
+            msg = f"Unsupported media type encountered '{media_type}'"
+            raise UnsupportedFeaturedException(msg)
+
+        mime_type = item.content_type
         if mime_type.endswith("mpeg"):
-            mime_type = sonic_song.suffix
-
-        self.logger.debug(
-            "Fetching stream details for id %s '%s' with format '%s'",
-            sonic_song.id,
-            sonic_song.title,
-            mime_type,
-        )
+            mime_type = item.suffix
 
         return StreamDetails(
-            item_id=sonic_song.id,
+            item_id=item.id,
             provider=self.instance_id,
             can_seek=self._seek_support,
+            media_type=media_type,
             audio_format=AudioFormat(content_type=ContentType.try_parse(mime_type)),
             stream_type=StreamType.CUSTOM,
-            duration=sonic_song.duration if sonic_song.duration is not None else 0,
+            duration=item.duration if item.duration else 0,
         )
 
     async def _report_playback_started(self, item_id: str) -> None:
         self.logger.debug("scrobble for now playing called for %s", item_id)
         await self._run_async(self._conn.scrobble, sid=item_id, submission=False)
 
-    async def on_streamed(self, streamdetails: StreamDetails, seconds_streamed: int) -> None:
+    async def on_streamed(
+        self,
+        streamdetails: StreamDetails,
+        seconds_streamed: int,
+        fully_played: bool = False,
+    ) -> None:
         """Handle callback when an item completed streaming."""
         self.logger.debug("on_streamed called for %s", streamdetails.item_id)
         if seconds_streamed >= streamdetails.duration / 2:
@@ -743,15 +906,22 @@ class OpenSonicProvider(MusicProvider):
         self.logger.debug("Streaming %s", streamdetails.item_id)
 
         def _streamer() -> None:
-            with self._conn.stream(
-                streamdetails.item_id, timeOffset=seek_position, estimateContentLength=True
-            ) as stream:
-                for chunk in stream.iter_content(chunk_size=40960):
-                    asyncio.run_coroutine_threadsafe(
-                        audio_buffer.put(chunk), self.mass.loop
-                    ).result()
-            # send empty chunk when we're done
-            asyncio.run_coroutine_threadsafe(audio_buffer.put(b"EOF"), self.mass.loop).result()
+            self.logger.debug("starting stream of item '%s'", streamdetails.item_id)
+            try:
+                with self._conn.stream(
+                    streamdetails.item_id,
+                    timeOffset=seek_position,
+                    estimateContentLength=True,
+                ) as stream:
+                    for chunk in stream.iter_content(chunk_size=40960):
+                        asyncio.run_coroutine_threadsafe(
+                            audio_buffer.put(chunk), self.mass.loop
+                        ).result()
+                # send empty chunk when we're done
+                asyncio.run_coroutine_threadsafe(audio_buffer.put(b"EOF"), self.mass.loop).result()
+            except DataNotFoundError as err:
+                msg = f"Item '{streamdetails.item_id}' not found"
+                raise MediaNotFoundError(msg) from err
 
         # fire up an executor thread to put the audio chunks (threadsafe) on the audio buffer
         streamer_task = self.mass.loop.run_in_executor(None, _streamer)

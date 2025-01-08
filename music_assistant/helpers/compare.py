@@ -355,8 +355,8 @@ def compare_podcast(
     if not strict and (isinstance(base_item, ItemMapping) or isinstance(compare_item, ItemMapping)):
         return True
     # for strict matching we REQUIRE both items to be a real Podcast object
-    assert isinstance(base_item, Audiobook)
-    assert isinstance(compare_item, Audiobook)
+    assert isinstance(base_item, Podcast)
+    assert isinstance(compare_item, Podcast)
     # compare publisher
     return not (
         base_item.publisher
@@ -558,7 +558,14 @@ def compare_version(base_version: str, compare_version: str) -> bool:
     base_versions = sorted(base_version.lower().split(" "))
     compare_versions = sorted(compare_version.lower().split(" "))
     # filter out words we can ignore (such as 'version')
-    ignore_words = [*IGNORE_VERSIONS, "version", "edition", "variant", "versie", "versione"]
+    ignore_words = [
+        *IGNORE_VERSIONS,
+        "version",
+        "edition",
+        "variant",
+        "versie",
+        "versione",
+    ]
     base_versions = [x for x in base_versions if x not in ignore_words]
     compare_versions = [x for x in compare_versions if x not in ignore_words]
 

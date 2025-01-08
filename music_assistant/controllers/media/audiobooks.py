@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.enums import MediaType, ProviderFeature
 from music_assistant_models.errors import InvalidDataError
-from music_assistant_models.media_items import Artist, Audiobook, Chapter, UniqueList
+from music_assistant_models.media_items import Artist, Audiobook, UniqueList
 
 from music_assistant.constants import DB_TABLE_AUDIOBOOKS
 from music_assistant.controllers.media.base import MediaControllerBase
@@ -49,7 +49,6 @@ class AudiobooksController(MediaControllerBase[Audiobook]):
             FROM audiobooks"""  # noqa: E501
         # register (extra) api handlers
         api_base = self.api_base
-        self.mass.register_api_command(f"music/{api_base}/audiobook_chapters", self.chapters)
         self.mass.register_api_command(f"music/{api_base}/audiobook_versions", self.versions)
 
     async def library_items(
@@ -93,27 +92,6 @@ class AudiobooksController(MediaControllerBase[Audiobook]):
             )
         return result
 
-    async def chapters(
-        self,
-        item_id: str,
-        provider_instance_id_or_domain: str,
-    ) -> UniqueList[Chapter]:
-        """Return audiobook chapters for the given provider audiobook id."""
-        # always check if we have a library item for this audiobook
-        library_audiobook = await self.get_library_item_by_prov_id(
-            item_id, provider_instance_id_or_domain
-        )
-        if not library_audiobook:
-            return await self._get_provider_audiobook_chapters(
-                item_id, provider_instance_id_or_domain
-            )
-        # return items from first/only provider
-        for provider_mapping in library_audiobook.provider_mappings:
-            return await self._get_provider_audiobook_chapters(
-                provider_mapping.item_id, provider_mapping.provider_instance
-            )
-        return UniqueList()
-
     async def versions(
         self,
         item_id: str,
@@ -153,9 +131,9 @@ class AudiobooksController(MediaControllerBase[Audiobook]):
                 "metadata": serialize_to_json(item.metadata),
                 "external_ids": serialize_to_json(item.external_ids),
                 "publisher": item.publisher,
-                "total_chapters": item.total_chapters,
-                "authors": item.authors,
-                "narrators": item.narrators,
+                "authors": serialize_to_json(item.authors),
+                "narrators": serialize_to_json(item.narrators),
+                "duration": item.duration,
             },
         )
         # update/set provider_mappings table
@@ -190,48 +168,20 @@ class AudiobooksController(MediaControllerBase[Audiobook]):
                     update.external_ids if overwrite else cur_item.external_ids
                 ),
                 "publisher": cur_item.publisher or update.publisher,
-                "total_chapters": cur_item.total_chapters or update.total_chapters,
-                "authors": update.authors if overwrite else cur_item.authors or update.authors,
-                "narrators": update.narrators
-                if overwrite
-                else cur_item.narrators or update.narrators,
+                "authors": serialize_to_json(
+                    update.authors if overwrite else cur_item.authors or update.authors
+                ),
+                "narrators": serialize_to_json(
+                    update.narrators if overwrite else cur_item.narrators or update.narrators
+                ),
+                "duration": update.duration or update.duration,
             },
         )
         # update/set provider_mappings table
         await self._set_provider_mappings(db_id, provider_mappings, overwrite)
         self.logger.debug("updated %s in database: (id %s)", update.name, db_id)
 
-    async def _get_provider_audiobook_chapters(
-        self, item_id: str, provider_instance_id_or_domain: str
-    ) -> list[Chapter]:
-        """Return audiobook chapters for the given provider audiobook id."""
-        prov: MusicProvider = self.mass.get_provider(provider_instance_id_or_domain)
-        if prov is None:
-            return []
-        # prefer cache items (if any) - for streaming providers only
-        cache_base_key = prov.lookup_key
-        cache_key = f"audiobook.{item_id}"
-        if (
-            prov.is_streaming_provider
-            and (cache := await self.mass.cache.get(cache_key, base_key=cache_base_key)) is not None
-        ):
-            return [Chapter.from_dict(x) for x in cache]
-        # no items in cache - get listing from provider
-        items = await prov.get_audiobook_chapters(item_id)
-        # store (serializable items) in cache
-        if prov.is_streaming_provider:
-            self.mass.create_task(
-                self.mass.cache.set(
-                    cache_key,
-                    [x.to_dict() for x in items],
-                    expiration=3600,
-                    base_key=cache_base_key,
-                ),
-            )
-
-        return items
-
-    async def _get_provider_dynamic_base_tracks(
+    async def radio_mode_base_tracks(
         self,
         item_id: str,
         provider_instance_id_or_domain: str,
@@ -239,11 +189,6 @@ class AudiobooksController(MediaControllerBase[Audiobook]):
     ) -> list[Track]:
         """Get the list of base tracks from the controller used to calculate the dynamic radio."""
         msg = "Dynamic tracks not supported for Radio MediaItem"
-        raise NotImplementedError(msg)
-
-    async def _get_dynamic_tracks(self, media_item: Audiobook, limit: int = 25) -> list[Track]:
-        """Get dynamic list of tracks for given item, fallback/default implementation."""
-        msg = "Dynamic tracks not supported for Audiobook MediaItem"
         raise NotImplementedError(msg)
 
     async def match_providers(self, db_audiobook: Audiobook) -> None:
@@ -259,7 +204,9 @@ class AudiobooksController(MediaControllerBase[Audiobook]):
 
         async def find_prov_match(provider: MusicProvider):
             self.logger.debug(
-                "Trying to match audiobook %s on provider %s", db_audiobook.name, provider.name
+                "Trying to match audiobook %s on provider %s",
+                db_audiobook.name,
+                provider.name,
             )
             match_found = False
             search_str = f"{author_name} - {db_audiobook.name}"

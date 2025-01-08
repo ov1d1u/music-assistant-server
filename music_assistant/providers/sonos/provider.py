@@ -67,7 +67,7 @@ class SonosPlayerProvider(PlayerProvider):
             "/sonos_queue/v2.3/timePlayed", self._handle_sonos_queue_time_played
         )
 
-    async def unload(self) -> None:
+    async def unload(self, is_removed: bool = False) -> None:
         """Handle close/cleanup of the provider."""
         # disconnect all players
         await asyncio.gather(*(player.unload() for player in self.sonos_players.values()))

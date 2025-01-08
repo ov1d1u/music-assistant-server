@@ -504,7 +504,7 @@ class MusicAssistant:
             if dep_prov.manifest.depends_on == prov_conf.domain:
                 await self.unload_provider(dep_prov.instance_id)
 
-    async def unload_provider(self, instance_id: str) -> None:
+    async def unload_provider(self, instance_id: str, is_removed: bool = False) -> None:
         """Unload a provider."""
         if provider := self._providers.get(instance_id):
             # remove mdns discovery if needed
@@ -525,7 +525,7 @@ class MusicAssistant:
                     player.available = False
                     self.players.update(player.player_id)
             try:
-                await provider.unload()
+                await provider.unload(is_removed)
             except Exception as err:
                 LOGGER.warning("Error while unload provider %s: %s", provider.name, str(err))
             finally:

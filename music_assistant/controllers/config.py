@@ -291,7 +291,7 @@ class ConfigController:
             msg = f"Builtin provider {prov_manifest.name} can not be removed."
             raise RuntimeError(msg)
         self.remove(conf_key)
-        await self.mass.unload_provider(instance_id)
+        await self.mass.unload_provider(instance_id, True)
         if existing["type"] == "music":
             # cleanup entries in library
             await self.mass.music.cleanup_provider(instance_id)
@@ -463,6 +463,7 @@ class ConfigController:
                 # add a tone control filter with the old values, reset the deprecated values and
                 # save this as the new DSP config
                 # TODO: remove this in a future release
+                dsp_config.enabled = True
                 dsp_config.filters.append(
                     ToneControlFilter(
                         enabled=True,
@@ -482,6 +483,9 @@ class ConfigController:
                         self.mass.config.set_raw_player_config_value(player_id, key, 0)
 
                 self.set(f"{CONF_PLAYER_DSP}/{player_id}", dsp_config.to_dict())
+            else:
+                # The DSP config does not do anything by default, so we disable it
+                dsp_config.enabled = False
 
             return dsp_config
 
@@ -579,7 +583,8 @@ class ConfigController:
             await self.get_core_config(core_controller)
             if include_values
             else CoreConfig.parse(
-                [], self.get(f"{CONF_CORE}/{core_controller}", {"domain": core_controller})
+                [],
+                self.get(f"{CONF_CORE}/{core_controller}", {"domain": core_controller}),
             )
             for core_controller in CONFIGURABLE_CORE_CONTROLLERS
         ]
@@ -674,7 +679,11 @@ class ConfigController:
         )
 
     def set_raw_provider_config_value(
-        self, provider_instance: str, key: str, value: ConfigValueType, encrypted: bool = False
+        self,
+        provider_instance: str,
+        key: str,
+        value: ConfigValueType,
+        encrypted: bool = False,
     ) -> None:
         """
         Set (raw) single config(entry) value for a provider.
@@ -890,7 +899,7 @@ class ConfigController:
                 "type": manifest.type.value,
                 "domain": manifest.domain,
                 "instance_id": instance_id,
-                "name": manifest.name,
+                "default_name": manifest.name,
                 "values": values,
             },
         )
@@ -907,4 +916,7 @@ class ConfigController:
             # loading failed, remove config
             self.remove(conf_key)
             raise
+        if prov.type == ProviderType.MUSIC:
+            # kick off initial library scan
+            self.mass.music.start_sync(None, [config.instance_id])
         return config

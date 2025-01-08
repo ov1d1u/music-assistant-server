@@ -175,7 +175,7 @@ class SiriusXMProvider(MusicProvider):
 
         self.logger.debug(f"SXM Proxy server running at {bind_ip}:{bind_port}")
 
-    async def unload(self) -> None:
+    async def unload(self, is_removed: bool = False) -> None:
         """
         Handle unload/close of the provider.
 

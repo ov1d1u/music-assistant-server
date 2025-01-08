@@ -13,11 +13,11 @@ from music_assistant_models.media_items import (
     Artist,
     Audiobook,
     BrowseFolder,
-    Chapter,
-    Episode,
     ItemMapping,
     MediaItemType,
     Playlist,
+    Podcast,
+    PodcastEpisode,
     Radio,
     SearchResults,
     Track,
@@ -63,7 +63,6 @@ class MusicProvider(Provider):
 
     async def loaded_in_mass(self) -> None:
         """Call after the provider has been loaded."""
-        self.mass.music.start_sync(providers=[self.instance_id])
 
     async def search(
         self,
@@ -117,7 +116,7 @@ class MusicProvider(Provider):
             raise NotImplementedError
         yield  # type: ignore
 
-    async def get_library_podcasts(self) -> AsyncGenerator[Audiobook, None]:
+    async def get_library_podcasts(self) -> AsyncGenerator[Podcast, None]:
         """Retrieve library/subscribed podcasts from the provider."""
         if ProviderFeature.LIBRARY_AUDIOBOOKS in self.supported_features:
             raise NotImplementedError
@@ -164,17 +163,12 @@ class MusicProvider(Provider):
         if ProviderFeature.LIBRARY_AUDIOBOOKS in self.supported_features:
             raise NotImplementedError
 
-    async def get_podcast(self, prov_podcast_id: str) -> Audiobook:  # type: ignore[return]
+    async def get_podcast(self, prov_podcast_id: str) -> Podcast:  # type: ignore[return]
         """Get full audiobook details by id."""
         if ProviderFeature.LIBRARY_PODCASTS in self.supported_features:
             raise NotImplementedError
 
-    async def get_chapter(self, prov_chapter_id: str) -> Chapter:  # type: ignore[return]
-        """Get (full) audiobook chapter details by id."""
-        if ProviderFeature.LIBRARY_AUDIOBOOKS in self.supported_features:
-            raise NotImplementedError
-
-    async def get_episode(self, prov_episode_id: str) -> Chapter:  # type: ignore[return]
+    async def get_podcast_episode(self, prov_episode_id: str) -> PodcastEpisode:
         """Get (full) podcast episode details by id."""
         if ProviderFeature.LIBRARY_PODCASTS in self.supported_features:
             raise NotImplementedError
@@ -196,19 +190,11 @@ class MusicProvider(Provider):
         if ProviderFeature.LIBRARY_PLAYLISTS in self.supported_features:
             raise NotImplementedError
 
-    async def get_audiobook_chapters(
-        self,
-        prov_audiobook_id: str,
-    ) -> list[Chapter]:
-        """Get all Chapters for given audiobook id."""
-        if ProviderFeature.LIBRARY_AUDIOBOOKS in self.supported_features:
-            raise NotImplementedError
-
     async def get_podcast_episodes(
         self,
         prov_podcast_id: str,
-    ) -> list[Episode]:
-        """Get all Episodes for given podcast id."""
+    ) -> list[PodcastEpisode]:
+        """Get all PodcastEpisodes for given podcast id."""
         if ProviderFeature.LIBRARY_PODCASTS in self.supported_features:
             raise NotImplementedError
 
@@ -342,7 +328,12 @@ class MusicProvider(Provider):
             yield
         raise NotImplementedError
 
-    async def on_streamed(self, streamdetails: StreamDetails, seconds_streamed: int) -> None:
+    async def on_streamed(
+        self,
+        streamdetails: StreamDetails,
+        seconds_streamed: int,
+        fully_played: bool = False,
+    ) -> None:
         """Handle callback when an item completed streaming."""
 
     async def resolve_image(self, path: str) -> str | bytes:
@@ -368,10 +359,8 @@ class MusicProvider(Provider):
             return await self.get_audiobook(prov_item_id)
         if media_type == MediaType.PODCAST:
             return await self.get_podcast(prov_item_id)
-        if media_type == MediaType.CHAPTER:
-            return await self.get_chapter(prov_item_id)
-        if media_type == MediaType.EPISODE:
-            return await self.get_episode(prov_item_id)
+        if media_type == MediaType.PODCAST_EPISODE:
+            return await self.get_podcast_episode(prov_item_id)
         return await self.get_track(prov_item_id)
 
     async def browse(self, path: str) -> Sequence[MediaItemType | ItemMapping]:  # noqa: PLR0915
@@ -396,7 +385,9 @@ class MusicProvider(Provider):
             query = "artists.item_id in :ids"
             query_params = {"ids": library_items}
             return await self.mass.music.artists.library_items(
-                provider=self.instance_id, extra_query=query, extra_query_params=query_params
+                provider=self.instance_id,
+                extra_query=query,
+                extra_query_params=query_params,
             )
         if subpath == "albums":
             library_items = await self.mass.cache.get(
@@ -584,7 +575,8 @@ class MusicProvider(Provider):
                     if not library_item and not prov_item.available:
                         # skip unavailable tracks
                         self.logger.debug(
-                            "Skipping sync of item %s because it is unavailable", prov_item.uri
+                            "Skipping sync of item %s because it is unavailable",
+                            prov_item.uri,
                         )
                         continue
                     if not library_item:
@@ -610,7 +602,9 @@ class MusicProvider(Provider):
                     await asyncio.sleep(0)  # yield to eventloop
                 except MusicAssistantError as err:
                     self.logger.warning(
-                        "Skipping sync of item %s - error details: %s", prov_item.uri, str(err)
+                        "Skipping sync of item %s - error details: %s",
+                        prov_item.uri,
+                        str(err),
                     )
 
             # process deletions (= no longer in library)
@@ -645,7 +639,10 @@ class MusicProvider(Provider):
                             await controller.set_favorite(db_id, False)
                 await asyncio.sleep(0)  # yield to eventloop
             await self.mass.cache.set(
-                media_type.value, list(cur_db_ids), category=cache_category, base_key=cache_base_key
+                media_type.value,
+                list(cur_db_ids),
+                category=cache_category,
+                base_key=cache_base_key,
             )
 
     # DO NOT OVERRIDE BELOW

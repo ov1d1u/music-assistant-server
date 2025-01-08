@@ -221,8 +221,8 @@ class AirplayProvider(PlayerProvider):
         # handle new player
         await self._setup_player(player_id, display_name, info)
 
-    async def unload(self) -> None:
-        """Handle close/cleanup of the provider."""
+    async def unload(self, is_removed: bool = False) -> None:
+        """Handle unload/close of the provider."""
         # power off all players (will disconnect and close cliraop)
         for player_id in self._players:
             await self.cmd_power(player_id, False)

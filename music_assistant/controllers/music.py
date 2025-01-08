@@ -34,7 +34,7 @@ from music_assistant_models.media_items import (
     MediaItemType,
     SearchResults,
 )
-from music_assistant_models.provider import ProviderInstance, SyncTask
+from music_assistant_models.provider import SyncTask
 
 from music_assistant.constants import (
     DB_TABLE_ALBUM_ARTISTS,
@@ -56,6 +56,7 @@ from music_assistant.constants import (
 from music_assistant.helpers.api import api_command
 from music_assistant.helpers.database import DatabaseConnection
 from music_assistant.helpers.datetime import utc_timestamp
+from music_assistant.helpers.json import json_loads, serialize_to_json
 from music_assistant.helpers.uri import parse_uri
 from music_assistant.helpers.util import TaskManager
 from music_assistant.models.core_controller import CoreController
@@ -74,11 +75,11 @@ if TYPE_CHECKING:
     from music_assistant.models.music_provider import MusicProvider
 
 CONF_RESET_DB = "reset_db"
-DEFAULT_SYNC_INTERVAL = 3 * 60  # default sync interval in minutes
+DEFAULT_SYNC_INTERVAL = 12 * 60  # default sync interval in minutes
 CONF_SYNC_INTERVAL = "sync_interval"
 CONF_DELETED_PROVIDERS = "deleted_providers"
 CONF_ADD_LIBRARY_ON_PLAY = "add_library_on_play"
-DB_SCHEMA_VERSION: Final[int] = 9
+DB_SCHEMA_VERSION: Final[int] = 14
 
 
 class MusicController(CoreController):
@@ -443,7 +444,12 @@ class MusicController(CoreController):
         else:
             back_path = f"{provider_instance}://" + "/".join(sub_path.split("/")[:-1])
             prepend_items.append(
-                BrowseFolder(item_id="back", provider=provider_instance, path=back_path, name="..")
+                BrowseFolder(
+                    item_id="back",
+                    provider=provider_instance,
+                    path=back_path,
+                    name="..",
+                )
             )
         # limit -1 to account for the prepended items
         prov_items = await prov.browse(path=path)
@@ -457,9 +463,11 @@ class MusicController(CoreController):
         if media_types is None:
             media_types = MediaType.ALL
         media_types_str = "(" + ",".join(f'"{x}"' for x in media_types) + ")"
+        # temporary fix to avoid too many queries on providers:
+        # we only query for library items for now
         query = (
-            f"SELECT * FROM {DB_TABLE_PLAYLOG} WHERE media_type "
-            f"in {media_types_str} ORDER BY timestamp DESC"
+            f"SELECT * FROM {DB_TABLE_PLAYLOG} WHERE provider = 'library' "
+            f"AND media_type in {media_types_str} ORDER BY timestamp DESC"
         )
         db_rows = await self.mass.music.database.get_rows_from_query(query, limit=limit)
         result: list[MediaItemType] = []
@@ -500,6 +508,9 @@ class MusicController(CoreController):
         if provider_instance_id_or_domain == "builtin":
             # handle special case of 'builtin' MusicProvider which allows us to play regular url's
             return await self.mass.get_provider("builtin").parse_item(item_id)
+        if media_type == MediaType.PODCAST_EPISODE:
+            # special case for podcast episodes
+            return await self.podcasts.episode(item_id, provider_instance_id_or_domain)
         ctrl = self.get_controller(media_type)
         return await ctrl.get(
             item_id=item_id,
@@ -648,7 +659,9 @@ class MusicController(CoreController):
                 continue
             with suppress(MediaNotFoundError):
                 media_item = await ctrl.get_provider_item(
-                    prov_mapping.item_id, prov_mapping.provider_instance, force_refresh=True
+                    prov_mapping.item_id,
+                    prov_mapping.provider_instance,
+                    force_refresh=True,
                 )
                 provider = media_item.provider
                 item_id = media_item.item_id
@@ -748,8 +761,14 @@ class MusicController(CoreController):
 
         return None
 
+    @api_command("music/mark_played")
     async def mark_item_played(
-        self, media_type: MediaType, item_id: str, provider_instance_id_or_domain: str
+        self,
+        media_type: MediaType,
+        item_id: str,
+        provider_instance_id_or_domain: str,
+        fully_played: bool | None = None,
+        seconds_played: int | None = None,
     ) -> None:
         """Mark item as played in playlog."""
         timestamp = utc_timestamp()
@@ -776,6 +795,8 @@ class MusicController(CoreController):
                 "item_id": item_id,
                 "provider": prov_key,
                 "media_type": media_type.value,
+                "fully_played": fully_played,
+                "seconds_played": seconds_played,
                 "timestamp": timestamp,
             },
             allow_replace=True,
@@ -799,6 +820,33 @@ class MusicController(CoreController):
                 f"last_played = {timestamp} WHERE item_id = {db_item.item_id}"
             )
         await self.database.commit()
+
+    @api_command("music/mark_unplayed")
+    async def mark_item_unplayed(
+        self, media_type: MediaType, item_id: str, provider_instance_id_or_domain: str
+    ) -> None:
+        """Mark item as unplayed in playlog."""
+        if provider_instance_id_or_domain == "library":
+            prov_key = "library"
+        elif prov := self.mass.get_provider(provider_instance_id_or_domain):
+            prov_key = prov.lookup_key
+        else:
+            prov_key = provider_instance_id_or_domain
+        # update generic playlog table
+        await self.database.delete(
+            DB_TABLE_PLAYLOG,
+            {
+                "item_id": item_id,
+                "provider": prov_key,
+                "media_type": media_type.value,
+            },
+        )
+        # also update playcount in library table
+        ctrl = self.get_controller(media_type)
+        db_item = await ctrl.get_library_item_by_prov_id(item_id, provider_instance_id_or_domain)
+        if db_item:
+            await self.database.execute(f"UPDATE {ctrl.db_table} SET play_count = play_count - 1")
+            await self.database.commit()
 
     def get_controller(
         self, media_type: MediaType
@@ -826,6 +874,8 @@ class MusicController(CoreController):
             return self.audiobooks
         if media_type == MediaType.PODCAST:
             return self.podcasts
+        if media_type == MediaType.PODCAST_EPISODE:
+            return self.podcasts
         return None
 
     def get_unique_providers(self) -> set[str]:
@@ -844,7 +894,7 @@ class MusicController(CoreController):
         return instances
 
     def _start_provider_sync(
-        self, provider: ProviderInstance, media_types: tuple[MediaType, ...]
+        self, provider: MusicProvider, media_types: tuple[MediaType, ...]
     ) -> None:
         """Start sync task on provider and track progress."""
         # check if we're not already running a sync task for this provider/mediatype
@@ -928,7 +978,8 @@ class MusicController(CoreController):
 
         # cleanup media items from db matched to deleted provider
         self.logger.info(
-            "Removing provider %s from library, this can take a a while...", provider_instance
+            "Removing provider %s from library, this can take a a while...",
+            provider_instance,
         )
         errors = 0
         for ctrl in (
@@ -938,6 +989,8 @@ class MusicController(CoreController):
             self.mass.music.tracks,
             self.mass.music.albums,
             self.mass.music.artists,
+            self.mass.music.podcasts,
+            self.mass.music.audiobooks,
             # run main controllers twice to rule out relations
             self.mass.music.tracks,
             self.mass.music.albums,
@@ -992,11 +1045,16 @@ class MusicController(CoreController):
 
     def _schedule_sync(self) -> None:
         """Schedule the periodic sync."""
-        self.start_sync()
-        sync_interval = self.config.get_value(CONF_SYNC_INTERVAL)
-        # we reschedule ourselves right after execution
-        # NOTE: sync_interval is stored in minutes, we need seconds
-        self.mass.loop.call_later(sync_interval * 60, self._schedule_sync)
+        sync_interval = self.config.get_value(CONF_SYNC_INTERVAL) * 60
+
+        def run_scheduled_sync() -> None:
+            # kickoff the sync job
+            self.start_sync()
+            # reschedule ourselves
+            self.mass.loop.call_later(sync_interval, self._schedule_sync)
+
+        # schedule the first sync run
+        self.mass.loop.call_later(sync_interval, run_scheduled_sync)
 
     async def _cleanup_database(self) -> None:
         """Perform database cleanup/maintenance."""
@@ -1006,7 +1064,13 @@ class MusicController(CoreController):
             DB_TABLE_PLAYLOG, f"timestamp < strftime('%s','now') - {3600 * 24  * 90}"
         )
         # db tables cleanup
-        for ctrl in (self.albums, self.artists, self.tracks, self.playlists, self.radio):
+        for ctrl in (
+            self.albums,
+            self.artists,
+            self.tracks,
+            self.playlists,
+            self.radio,
+        ):
             # Provider mappings where the db item is removed
             query = (
                 f"item_id not in (SELECT item_id from {ctrl.db_table}) "
@@ -1094,7 +1158,7 @@ class MusicController(CoreController):
             "Migrating database from version %s to %s", prev_version, DB_SCHEMA_VERSION
         )
 
-        if prev_version <= 4:
+        if prev_version <= 6:
             # unhandled schema version
             # we do not try to handle more complex migrations
             self.logger.warning(
@@ -1162,6 +1226,39 @@ class MusicController(CoreController):
                 )
             await self.database.execute("DROP TABLE IF EXISTS track_loudness")
 
+        if prev_version <= 10:
+            # add new columns to playlog table
+            try:
+                await self.database.execute(
+                    f"ALTER TABLE {DB_TABLE_PLAYLOG} ADD COLUMN fully_played BOOLEAN"
+                )
+                await self.database.execute(
+                    f"ALTER TABLE {DB_TABLE_PLAYLOG} ADD COLUMN seconds_played INTEGER"
+                )
+            except Exception as err:
+                if "duplicate column" not in str(err):
+                    raise
+
+        if prev_version <= 12:
+            # Need to drop the NOT NULL requirement on podcasts.publisher and audiobooks.publisher
+            # However, because there is no ALTER COLUMN support in sqlite, we will need
+            # to create the tables again.
+            await self.database.execute(f"DROP TABLE IF EXISTS {DB_TABLE_AUDIOBOOKS}")
+            await self.database.execute(f"DROP TABLE IF EXISTS {DB_TABLE_PODCASTS}")
+            await self.__create_database_tables()
+
+        if prev_version <= 13:
+            # migrate chapters in metadata
+            # this is leftover mess from the old chapters implementation
+            for db_row in await self.database.search(DB_TABLE_TRACKS, "position_start", "metadata"):
+                metadata = json_loads(db_row["metadata"])
+                metadata["chapters"] = None
+                await self.database.update(
+                    DB_TABLE_TRACKS,
+                    {"item_id": db_row["item_id"]},
+                    {"metadata": serialize_to_json(metadata)},
+                )
+
         # save changes
         await self.database.commit()
 
@@ -1191,6 +1288,8 @@ class MusicController(CoreController):
                 [provider] TEXT NOT NULL,
                 [media_type] TEXT NOT NULL DEFAULT 'track',
                 [timestamp] INTEGER DEFAULT 0,
+                [fully_played] BOOLEAN,
+                [seconds_played] INTEGER,
                 UNIQUE(item_id, provider, media_type));"""
         )
         await self.database.execute(
@@ -1281,12 +1380,13 @@ class MusicController(CoreController):
             [item_id] INTEGER PRIMARY KEY AUTOINCREMENT,
             [name] TEXT NOT NULL,
             [sort_name] TEXT NOT NULL,
+            [version] TEXT,
             [favorite] BOOLEAN DEFAULT 0,
-            [publisher] TEXT NOT NULL,
-            [total_chapters] INTEGER NOT NULL,
+            [publisher] TEXT,
             [authors] json NOT NULL,
             [narrators] json NOT NULL,
             [metadata] json NOT NULL,
+            [duration] INTEGER,
             [external_ids] json NOT NULL,
             [play_count] INTEGER DEFAULT 0,
             [last_played] INTEGER DEFAULT 0,
@@ -1300,9 +1400,10 @@ class MusicController(CoreController):
             [item_id] INTEGER PRIMARY KEY AUTOINCREMENT,
             [name] TEXT NOT NULL,
             [sort_name] TEXT NOT NULL,
+            [version] TEXT,
             [favorite] BOOLEAN DEFAULT 0,
-            [publisher] TEXT NOT NULL,
-            [total_episodes] INTEGER NOT NULL,
+            [publisher] TEXT,
+            [total_episodes] INTEGER,
             [metadata] json NOT NULL,
             [external_ids] json NOT NULL,
             [play_count] INTEGER DEFAULT 0,

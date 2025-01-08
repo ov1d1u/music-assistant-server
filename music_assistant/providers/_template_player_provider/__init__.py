@@ -122,11 +122,12 @@ class MyDemoPlayerprovider(PlayerProvider):
         # you can use this for instance to trigger custom (non-mdns) discovery of players
         # or any other logic that needs to run after the provider is fully loaded.
 
-    async def unload(self) -> None:
+    async def unload(self, is_removed: bool = False) -> None:
         """
         Handle unload/close of the provider.
 
         Called when provider is deregistered (e.g. MA exiting or config reloading).
+        is_removed will be set to True when the provider is removed from the configuration.
         """
         # OPTIONAL
         # this is an optional method that you can implement if
