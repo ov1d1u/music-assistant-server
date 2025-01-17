@@ -39,18 +39,18 @@ from music_assistant.constants import (
     CONF_OUTPUT_CHANNELS,
     CONF_PUBLISH_IP,
     CONF_SAMPLE_RATES,
-    CONF_VOLUME_NORMALIZATION,
     CONF_VOLUME_NORMALIZATION_FIXED_GAIN_RADIO,
     CONF_VOLUME_NORMALIZATION_FIXED_GAIN_TRACKS,
     CONF_VOLUME_NORMALIZATION_RADIO,
     CONF_VOLUME_NORMALIZATION_TRACKS,
-    MASS_LOGO_ONLINE,
+    DEFAULT_PCM_FORMAT,
+    DEFAULT_STREAM_HEADERS,
+    ICY_HEADERS,
     SILENCE_FILE,
     VERBOSE_LOG_LEVEL,
 )
 from music_assistant.helpers.audio import LOGGER as AUDIO_LOGGER
 from music_assistant.helpers.audio import (
-    check_audio_support,
     crossfade_pcm_parts,
     get_chunksize,
     get_hls_substream,
@@ -61,7 +61,7 @@ from music_assistant.helpers.audio import (
     get_stream_details,
 )
 from music_assistant.helpers.ffmpeg import LOGGER as FFMPEG_LOGGER
-from music_assistant.helpers.ffmpeg import get_ffmpeg_stream
+from music_assistant.helpers.ffmpeg import check_ffmpeg_version, get_ffmpeg_stream
 from music_assistant.helpers.util import get_ip, get_ips, select_free_port, try_parse_bool
 from music_assistant.helpers.webserver import Webserver
 from music_assistant.models.core_controller import CoreController
@@ -73,23 +73,6 @@ if TYPE_CHECKING:
     from music_assistant_models.player_queue import PlayerQueue
     from music_assistant_models.queue_item import QueueItem
     from music_assistant_models.streamdetails import StreamDetails
-
-
-DEFAULT_STREAM_HEADERS = {
-    "Server": "Music Assistant",
-    "transferMode.dlna.org": "Streaming",
-    "contentFeatures.dlna.org": "DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=0d500000000000000000000000000000",  # noqa: E501
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-}
-ICY_HEADERS = {
-    "icy-name": "Music Assistant",
-    "icy-description": "Music Assistant - Your personal music assistant",
-    "icy-version": "1",
-    "icy-logo": MASS_LOGO_ONLINE,
-}
-FLOW_DEFAULT_SAMPLE_RATE = 48000
-FLOW_DEFAULT_BIT_DEPTH = 24
 
 
 isfile = wrap(os.path.isfile)
@@ -216,25 +199,11 @@ class StreamsController(CoreController):
 
     async def setup(self, config: CoreConfig) -> None:
         """Async initialize of module."""
-        ffmpeg_present, libsoxr_support, version = await check_audio_support()
-        major_version = int("".join(char for char in version.split(".")[0] if not char.isalpha()))
-        if not ffmpeg_present:
-            self.logger.error("FFmpeg binary not found on your system, playback will NOT work!.")
-        elif major_version < 6:
-            self.logger.error("FFMpeg version is too old, you may run into playback issues.")
-        elif not libsoxr_support:
-            self.logger.warning(
-                "FFmpeg version found without libsoxr support, "
-                "highest quality audio not available. "
-            )
-        self.logger.info(
-            "Detected ffmpeg version %s %s",
-            version,
-            "with libsoxr support" if libsoxr_support else "",
-        )
         # copy log level to audio/ffmpeg loggers
         AUDIO_LOGGER.setLevel(self.logger.level)
         FFMPEG_LOGGER.setLevel(self.logger.level)
+        # perform check for ffmpeg version
+        await check_ffmpeg_version()
         # start the webserver
         self.publish_port = config.get_value(CONF_BIND_PORT)
         self.publish_ip = config.get_value(CONF_PUBLISH_IP)
@@ -353,7 +322,7 @@ class StreamsController(CoreController):
             return resp
 
         # all checks passed, start streaming!
-        self.logger.debug(
+        self.logger.info(
             "Start serving audio stream for QueueItem %s (%s) to %s",
             queue_item.name,
             queue_item.uri,
@@ -361,17 +330,10 @@ class StreamsController(CoreController):
         )
 
         # pick pcm format based on the streamdetails and player capabilities
-        if self.mass.config.get_raw_player_config_value(queue_id, CONF_VOLUME_NORMALIZATION, True):
-            # prefer f32 when volume normalization is enabled
-            bit_depth = 32
-            floating_point = True
-        else:
-            bit_depth = queue_item.streamdetails.audio_format.bit_depth
-            floating_point = False
         pcm_format = AudioFormat(
-            content_type=ContentType.from_bit_depth(bit_depth, floating_point),
+            content_type=DEFAULT_PCM_FORMAT.content_type,
             sample_rate=queue_item.streamdetails.audio_format.sample_rate,
-            bit_depth=bit_depth,
+            bit_depth=DEFAULT_PCM_FORMAT.bit_depth,
             channels=2,
         )
         chunk_num = 0
@@ -403,6 +365,10 @@ class StreamsController(CoreController):
                 queue_item.uri,
                 queue.display_name,
             )
+            # some players do not like it when we dont return anything after an error
+            # so we send some silence so they move on to the next track on their own (hopefully)
+            async for chunk in get_silence(10, output_format):
+                await resp.write(chunk)
         return resp
 
     async def serve_queue_flow_stream(self, request: web.Request) -> web.Response:
@@ -613,7 +579,7 @@ class StreamsController(CoreController):
         if not (source := await provider.get_source(source_id)):
             raise web.HTTPNotFound(reason=f"Unknown PluginSource: {source_id}")
         try:
-            streamdetails = await provider.get_stream_details(source_id, MediaType.PLUGIN_SOURCE)
+            streamdetails = await provider.get_stream_details(source_id, "plugin_source")
         except Exception:
             err_msg = f"No streamdetails for PluginSource: {source_id}"
             self.logger.error(err_msg)
@@ -761,7 +727,7 @@ class StreamsController(CoreController):
                     queue_track.queue_item_id,
                 )
 
-            self.logger.debug(
+            self.logger.info(
                 "Start Streaming queue track: %s (%s) for queue %s",
                 queue_track.streamdetails.uri,
                 queue_track.name,
@@ -910,42 +876,28 @@ class StreamsController(CoreController):
         pcm_format: AudioFormat,
     ) -> AsyncGenerator[tuple[bool, bytes], None]:
         """Get the audio stream for the given streamdetails as raw pcm chunks."""
-        is_radio = streamdetails.media_type == MediaType.RADIO or not streamdetails.duration
-        if is_radio:
-            streamdetails.seek_position = 0
         # collect all arguments for ffmpeg
         filter_params = []
-        extra_input_args = []
+        extra_input_args = streamdetails.extra_input_args or []
         # handle volume normalization
-        enable_volume_normalization = (
-            streamdetails.target_loudness is not None
-            and streamdetails.volume_normalization_mode != VolumeNormalizationMode.DISABLED
-        )
-        dynamic_volume_normalization = (
-            streamdetails.volume_normalization_mode == VolumeNormalizationMode.DYNAMIC
-            and enable_volume_normalization
-        )
-        if dynamic_volume_normalization:
+        if streamdetails.volume_normalization_mode == VolumeNormalizationMode.DYNAMIC:
             # volume normalization using loudnorm filter (in dynamic mode)
             # which also collects the measurement on the fly during playback
             # more info: https://k.ylo.ph/2016/04/04/loudnorm.html
             filter_rule = f"loudnorm=I={streamdetails.target_loudness}:TP=-2.0:LRA=10.0:offset=0.0"
             filter_rule += ":print_format=json"
             filter_params.append(filter_rule)
-        elif (
-            enable_volume_normalization
-            and streamdetails.volume_normalization_mode == VolumeNormalizationMode.FIXED_GAIN
-        ):
+        elif streamdetails.volume_normalization_mode == VolumeNormalizationMode.FIXED_GAIN:
             # apply used defined fixed volume/gain correction
             gain_correct: float = await self.mass.config.get_core_config_value(
                 self.domain,
-                CONF_VOLUME_NORMALIZATION_FIXED_GAIN_RADIO
-                if streamdetails.media_type == MediaType.RADIO
-                else CONF_VOLUME_NORMALIZATION_FIXED_GAIN_TRACKS,
+                CONF_VOLUME_NORMALIZATION_FIXED_GAIN_TRACKS
+                if streamdetails.media_type == MediaType.TRACK
+                else CONF_VOLUME_NORMALIZATION_FIXED_GAIN_RADIO,
             )
             gain_correct = round(gain_correct, 2)
             filter_params.append(f"volume={gain_correct}dB")
-        elif enable_volume_normalization and streamdetails.loudness is not None:
+        elif streamdetails.volume_normalization_mode == VolumeNormalizationMode.MEASUREMENT_ONLY:
             # volume normalization with known loudness measurement
             # apply volume/gain correction
             gain_correct = streamdetails.target_loudness - streamdetails.loudness
@@ -978,8 +930,11 @@ class StreamsController(CoreController):
         # handle seek support
         if (
             streamdetails.seek_position
-            and streamdetails.media_type != MediaType.RADIO
-            and streamdetails.stream_type != StreamType.CUSTOM
+            and streamdetails.duration
+            and streamdetails.allow_seek
+            # allow seeking for custom streams,
+            # but only for custom streams that can't seek theirselves
+            and (streamdetails.stream_type != StreamType.CUSTOM or not streamdetails.can_seek)
         ):
             extra_input_args += ["-ss", str(int(streamdetails.seek_position))]
 
@@ -987,7 +942,11 @@ class StreamsController(CoreController):
             # pad some silence before the radio stream starts to create some headroom
             # for radio stations that do not provide any look ahead buffer
             # without this, some radio streams jitter a lot, especially with dynamic normalization
-            pad_seconds = 5 if dynamic_volume_normalization else 2
+            pad_seconds = (
+                5
+                if streamdetails.volume_normalization_mode == VolumeNormalizationMode.DYNAMIC
+                else 2
+            )
             async for chunk in get_silence(pad_seconds, pcm_format):
                 yield chunk
 
@@ -1099,24 +1058,13 @@ class StreamsController(CoreController):
             player.player_id, CONF_SAMPLE_RATES
         )
         supported_sample_rates: tuple[int] = tuple(x[0] for x in supported_rates_conf)
-        supported_bit_depths: tuple[int] = tuple(x[1] for x in supported_rates_conf)
-        player_max_bit_depth = max(supported_bit_depths)
-        for sample_rate in (192000, 96000, 48000, 44100):
+        for sample_rate in (192000, 96000, DEFAULT_PCM_FORMAT.sample_rate):
             if sample_rate in supported_sample_rates:
                 output_sample_rate = sample_rate
                 break
-        if self.mass.config.get_raw_player_config_value(
-            player.player_id, CONF_VOLUME_NORMALIZATION, True
-        ):
-            # prefer f32 when volume normalization is enabled
-            output_bit_depth = 32
-            floating_point = True
-        else:
-            output_bit_depth = min(24, player_max_bit_depth)
-            floating_point = False
         return AudioFormat(
-            content_type=ContentType.from_bit_depth(output_bit_depth, floating_point),
+            content_type=DEFAULT_PCM_FORMAT.content_type,
             sample_rate=output_sample_rate,
-            bit_depth=output_bit_depth,
+            bit_depth=DEFAULT_PCM_FORMAT.bit_depth,
             channels=2,
         )

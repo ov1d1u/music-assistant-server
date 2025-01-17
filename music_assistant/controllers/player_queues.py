@@ -57,7 +57,7 @@ from music_assistant.constants import (
     MASS_LOGO_ONLINE,
 )
 from music_assistant.helpers.api import api_command
-from music_assistant.helpers.audio import get_stream_details
+from music_assistant.helpers.audio import get_stream_details, get_stream_dsp_details
 from music_assistant.helpers.throttle_retry import BYPASS_THROTTLER
 from music_assistant.helpers.util import get_changed_keys
 from music_assistant.models.core_controller import CoreController
@@ -108,6 +108,7 @@ class CompareState(TypedDict):
     elapsed_time: int
     stream_title: str | None
     content_type: str | None
+    group_childs_count: int
 
 
 class PlayerQueuesController(CoreController):
@@ -962,6 +963,7 @@ class PlayerQueuesController(CoreController):
                 next_item_id=None,
                 elapsed_time=0,
                 stream_title=None,
+                group_childs_count=0,
             ),
         )
 
@@ -978,6 +980,7 @@ class PlayerQueuesController(CoreController):
             content_type=queue.current_item.streamdetails.audio_format.output_format_str
             if queue.current_item and queue.current_item.streamdetails
             else None,
+            group_childs_count=len(player.group_childs),
         )
         changed_keys = get_changed_keys(prev_state, new_state)
         # return early if nothing changed
@@ -999,6 +1002,14 @@ class PlayerQueuesController(CoreController):
         else:
             self._prev_states.pop(queue_id, None)
 
+        if "group_childs_count" in changed_keys:
+            # refresh DSP details since a player has been added/removed from the group
+            dsp = get_stream_dsp_details(self.mass, queue_id)
+            if queue.current_item and queue.current_item.streamdetails:
+                queue.current_item.streamdetails.dsp = dsp
+            if queue.next_item and queue.next_item.streamdetails:
+                queue.next_item.streamdetails.dsp = dsp
+
         # detect change in current index to report that a item has been played
         prev_item_id = prev_state["current_item_id"]
         player_stopped = (
@@ -1013,25 +1024,20 @@ class PlayerQueuesController(CoreController):
             and (prev_item := self.get_item(queue_id, prev_item_id))
             and (stream_details := prev_item.streamdetails)
         ):
-            seconds_played = int(prev_state["elapsed_time"])
-            fully_played = seconds_played >= (stream_details.duration or 3600) - 5
+            position = int(prev_state["elapsed_time"])
+            seconds_played = int(prev_state["elapsed_time"]) - stream_details.seek_position
+            fully_played = position >= (stream_details.duration or 3600) - 5
             self.logger.debug(
                 "PlayerQueue %s played item %s for %s seconds",
                 queue.display_name,
                 prev_item.uri,
                 seconds_played,
             )
-            if music_prov := self.mass.get_provider(stream_details.provider):
-                self.mass.create_task(
-                    music_prov.on_streamed(stream_details, seconds_played, fully_played)
-                )
             if prev_item.media_item and (fully_played or seconds_played > 10):
                 # add entry to playlog - this also handles resume of podcasts/audiobooks
                 self.mass.create_task(
                     self.mass.music.mark_item_played(
-                        stream_details.media_type,
-                        stream_details.item_id,
-                        stream_details.provider,
+                        prev_item.media_item,
                         fully_played=fully_played,
                         seconds_played=seconds_played,
                     )
@@ -1042,7 +1048,23 @@ class PlayerQueuesController(CoreController):
                     EventType.MEDIA_ITEM_PLAYED,
                     object_id=prev_item.media_item.uri,
                     data={
-                        "media_item": prev_item.media_item.uri,
+                        # TODO: Maybe we should create a dataclass for this as well?!
+                        "media_item": {
+                            "uri": prev_item.media_item.uri,
+                            "name": prev_item.media_item.name,
+                            "media_type": prev_item.media_item.media_type,
+                            "artist": getattr(prev_item.media_item, "artist_str", None),
+                            "album": album.name
+                            if (album := getattr(prev_item.media_item, "album", None))
+                            else None,
+                            "image_url": self.mass.metadata.get_image_url(
+                                prev_item.media_item.image, size=512
+                            )
+                            if prev_item.media_item.image
+                            else None,
+                            "duration": getattr(prev_item.media_item, "duration", 0),
+                            "mbid": getattr(prev_item.media_item, "mbid", None),
+                        },
                         "seconds_played": seconds_played,
                         "fully_played": fully_played,
                     },
@@ -1125,9 +1147,9 @@ class PlayerQueuesController(CoreController):
                 break
             except MediaNotFoundError:
                 # No stream details found, skip this QueueItem
-                self.logger.debug("Skipping unplayable item: %s", next_item)
-                if queue_item.media_item:
-                    queue_item.media_item.available = False
+                self.logger.info(
+                    "Skipping unplayable item %s (%s)", queue_item.name, queue_item.uri
+                )
                 idx += 1
         if next_item is None:
             raise QueueEmpty("No more (playable) tracks left in the queue.")
@@ -1164,7 +1186,7 @@ class PlayerQueuesController(CoreController):
                 and queue_item.media_item.album.item_id == next_item.media_item.album.item_id
             )
         )
-        if queue_item.media_item:
+        if queue_item.media_item and queue_item.media_item.media_type == MediaType.TRACK:
             # prefer the full library media item so we have all metadata and provider(quality) info
             # always request the full library item as there might be other qualities available
             if library_item := await self.mass.music.get_library_item_by_prov_id(
@@ -1209,7 +1231,7 @@ class PlayerQueuesController(CoreController):
             return
         # enqueue next track on the player if we're not in flow mode
         task_id = f"enqueue_next_item_{queue_id}"
-        self.mass.call_later(5, self._enqueue_next_item, queue_id, item_id, task_id=task_id)
+        self.mass.call_later(2, self._enqueue_next_item, queue_id, item_id, task_id=task_id)
 
     # Main queue manipulation methods
 
@@ -1538,7 +1560,10 @@ class PlayerQueuesController(CoreController):
 
     async def _enqueue_next_item(self, queue_id: str, current_item_id: str) -> None:
         """Enqueue the next item on the player."""
-        next_item = await self.load_next_item(queue_id, current_item_id)
+        try:
+            next_item = await self.load_next_item(queue_id, current_item_id)
+        except QueueEmpty:
+            return
         await self.mass.players.enqueue_next_media(
             player_id=queue_id,
             media=self.player_media_from_queue_item(next_item, False),
@@ -1554,36 +1579,20 @@ class PlayerQueuesController(CoreController):
     ) -> list[MediaItemType]:
         """Resolve/unwrap media items to enqueue."""
         if media_item.media_type == MediaType.PLAYLIST:
-            self.mass.create_task(
-                self.mass.music.mark_item_played(
-                    media_item.media_type, media_item.item_id, media_item.provider
-                )
-            )
+            self.mass.create_task(self.mass.music.mark_item_played(media_item))
             return await self.get_playlist_tracks(media_item, start_item)
         if media_item.media_type == MediaType.ARTIST:
-            self.mass.create_task(
-                self.mass.music.mark_item_played(
-                    media_item.media_type, media_item.item_id, media_item.provider
-                )
-            )
+            self.mass.create_task(self.mass.music.mark_item_played(media_item))
             return await self.get_artist_tracks(media_item)
         if media_item.media_type == MediaType.ALBUM:
-            self.mass.create_task(
-                self.mass.music.mark_item_played(
-                    media_item.media_type, media_item.item_id, media_item.provider
-                )
-            )
+            self.mass.create_task(self.mass.music.mark_item_played(media_item))
             return await self.get_album_tracks(media_item, start_item)
         if media_item.media_type == MediaType.AUDIOBOOK:
             if resume_point := await self.get_audiobook_resume_point(media_item, start_item):
                 media_item.resume_position_ms = resume_point
             return [media_item]
         if media_item.media_type == MediaType.PODCAST:
-            self.mass.create_task(
-                self.mass.music.mark_item_played(
-                    media_item.media_type, media_item.item_id, media_item.provider
-                )
-            )
+            self.mass.create_task(self.mass.music.mark_item_played(media_item))
             return await self.get_next_podcast_episodes(media_item, start_item or media_item)
         if media_item.media_type == MediaType.PODCAST_EPISODE:
             return await self.get_next_podcast_episodes(None, media_item)
