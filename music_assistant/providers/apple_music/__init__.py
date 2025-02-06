@@ -352,9 +352,7 @@ class AppleMusicProvider(MusicProvider):
                     found_tracks.append(self._parse_track(track))
         return found_tracks
 
-    async def get_stream_details(
-        self, item_id: str, media_type: MediaType = MediaType.TRACK
-    ) -> StreamDetails:
+    async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Return the content details for the given track when it will be streamed."""
         stream_metadata = await self._fetch_song_stream_metadata(item_id)
         license_url = stream_metadata["hls-key-server-url"]
@@ -364,7 +362,7 @@ class AppleMusicProvider(MusicProvider):
         key_id = base64.b64decode(uri.split(",")[1])
         return StreamDetails(
             item_id=item_id,
-            provider=self.instance_id,
+            provider=self.lookup_key,
             audio_format=AudioFormat(
                 content_type=ContentType.UNKNOWN,
             ),
@@ -372,6 +370,7 @@ class AppleMusicProvider(MusicProvider):
             path=stream_url,
             decryption_key=await self._get_decryption_key(license_url, key_id, uri, item_id),
             can_seek=True,
+            allow_seek=True,
         )
 
     def _parse_artist(self, artist_obj):
@@ -392,7 +391,7 @@ class AppleMusicProvider(MusicProvider):
             # No more details available other than the id, return an ItemMapping
             return ItemMapping(
                 media_type=MediaType.ARTIST,
-                provider=self.instance_id,
+                provider=self.lookup_key,
                 item_id=artist_id,
                 name=artist_id,
             )
@@ -443,7 +442,7 @@ class AppleMusicProvider(MusicProvider):
             # No more details available other than the id, return an ItemMapping
             return ItemMapping(
                 media_type=MediaType.ALBUM,
-                provider=self.instance_id,
+                provider=self.lookup_key,
                 item_id=album_id,
                 name=album_id,
             )
@@ -474,7 +473,7 @@ class AppleMusicProvider(MusicProvider):
             album.artists = [
                 ItemMapping(
                     media_type=MediaType.ARTIST,
-                    provider=self.instance_id,
+                    provider=self.lookup_key,
                     item_id=artist_name,
                     name=artist_name,
                 )
@@ -556,7 +555,7 @@ class AppleMusicProvider(MusicProvider):
                 ItemMapping(
                     media_type=MediaType.ARTIST,
                     item_id=artist_name,
-                    provider=self.instance_id,
+                    provider=self.lookup_key,
                     name=artist_name,
                 )
             ]
@@ -584,9 +583,10 @@ class AppleMusicProvider(MusicProvider):
         """Parse Apple Music playlist object to generic layout."""
         attributes = playlist_obj["attributes"]
         playlist_id = attributes["playParams"].get("globalId") or playlist_obj["id"]
+        is_editable = attributes.get("canEdit", False)
         playlist = Playlist(
             item_id=playlist_id,
-            provider=self.domain,
+            provider=self.instance_id if is_editable else self.lookup_key,
             name=attributes["name"],
             owner=attributes.get("curatorName", "me"),
             provider_mappings={
@@ -597,6 +597,7 @@ class AppleMusicProvider(MusicProvider):
                     url=attributes.get("url"),
                 )
             },
+            is_editable=is_editable,
         )
         if artwork := attributes.get("artwork"):
             url = artwork["url"]
@@ -612,7 +613,6 @@ class AppleMusicProvider(MusicProvider):
             ]
         if description := attributes.get("description"):
             playlist.metadata.description = description.get("standard")
-        playlist.is_editable = attributes.get("canEdit", False)
         if checksum := attributes.get("lastModifiedDate"):
             playlist.cache_checksum = checksum
         return playlist

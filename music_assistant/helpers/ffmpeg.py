@@ -7,6 +7,7 @@ import logging
 import time
 from collections import deque
 from collections.abc import AsyncGenerator
+from contextlib import suppress
 from typing import TYPE_CHECKING, Final
 
 from music_assistant_models.enums import ContentType
@@ -58,6 +59,7 @@ class FFMpeg(AsyncProcess):
         self.log_history: deque[str] = deque(maxlen=100)
         self._stdin_task: asyncio.Task | None = None
         self._logger_task: asyncio.Task | None = None
+        self._input_codec_parsed = False
         super().__init__(
             ffmpeg_args,
             stdin=True if isinstance(audio_input, str | AsyncGenerator) else audio_input,
@@ -91,6 +93,8 @@ class FFMpeg(AsyncProcess):
             return
         if self._stdin_task and not self._stdin_task.done():
             self._stdin_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._stdin_task
         await super().close(send_signal)
 
     async def _log_reader_task(self) -> None:
@@ -114,15 +118,19 @@ class FFMpeg(AsyncProcess):
 
             # if streamdetails contenttype is unknown, try parse it from the ffmpeg log
             if line.startswith("Stream #") and ": Audio: " in line:
-                if self.input_format.content_type == ContentType.UNKNOWN:
+                if not self._input_codec_parsed:
                     content_type_raw = line.split(": Audio: ")[1].split(" ")[0]
+                    content_type_raw = content_type_raw.split(",")[0]
                     content_type = ContentType.try_parse(content_type_raw)
                     self.logger.debug(
                         "Detected (input) content type: %s (%s)",
                         content_type,
                         content_type_raw,
                     )
-                    self.input_format.content_type = content_type
+                    if self.input_format.content_type == ContentType.UNKNOWN:
+                        self.input_format.content_type = content_type
+                    self.input_format.codec_type = content_type
+                    self._input_codec_parsed = True
             del line
 
     async def _feed_stdin(self) -> None:
@@ -140,6 +148,8 @@ class FFMpeg(AsyncProcess):
             # so this timeout is just to catch if the source is stuck and rpeort it and not
             # to recover from it.
             async for chunk in TimedAsyncGenerator(self.audio_input, timeout=300):
+                if self.closed:
+                    return
                 await self.write(chunk)
             self.logger.log(
                 VERBOSE_LOG_LEVEL, "Audio data source exhausted in %.2fs", time.time() - start
@@ -147,13 +157,12 @@ class FFMpeg(AsyncProcess):
             generator_exhausted = True
         except Exception as err:
             cancelled = isinstance(err, asyncio.CancelledError)
-            if cancelled:
-                raise
             self.logger.error(
                 "Stream error: %s",
                 str(err) or err.__class__.__name__,
-                exc_info=err if self.logger.isEnabledFor(VERBOSE_LOG_LEVEL) else None,
+                exc_info=err if self.logger.isEnabledFor(logging.DEBUG) else None,
             )
+            raise
         finally:
             if not cancelled:
                 await self.write_eof()
@@ -214,7 +223,7 @@ def get_ffmpeg_args(
         "-nostats",
         "-ignore_unknown",
         "-protocol_whitelist",
-        "file,hls,http,https,tcp,tls,crypto,pipe,data,fd,rtp,udp",
+        "file,hls,http,https,tcp,tls,crypto,pipe,data,fd,rtp,udp,concat",
     ]
     # collect input args
     input_args = []

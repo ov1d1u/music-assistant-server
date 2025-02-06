@@ -148,7 +148,7 @@ class AirplayProvider(PlayerProvider):
         self._players = {}
         self.cliraop_bin: str | None = await get_cliraop_binary()
         dacp_port = await select_free_port(39831, 49831)
-        self.dacp_id = dacp_id = f"{randrange(2 ** 64):X}"
+        self.dacp_id = dacp_id = f"{randrange(2**64):X}"
         self.logger.debug("Starting DACP ActiveRemote %s on port %s", dacp_id, dacp_port)
         self._dacp_server = await asyncio.start_server(
             self._handle_dacp_request, "0.0.0.0", dacp_port
@@ -221,8 +221,8 @@ class AirplayProvider(PlayerProvider):
     async def unload(self, is_removed: bool = False) -> None:
         """Handle unload/close of the provider."""
         # power off all players (will disconnect and close cliraop)
-        for player_id in self._players:
-            await self.cmd_power(player_id, False)
+        for player in self._players.values():
+            await player.cmd_stop()
         # shutdown DACP server
         if self._dacp_server:
             self._dacp_server.close()
@@ -380,9 +380,6 @@ class AirplayProvider(PlayerProvider):
         parent_player.group_childs.append(parent_player.player_id)
         parent_player.group_childs.append(child_player.player_id)
         child_player.synced_to = parent_player.player_id
-        # mark players as powered
-        parent_player.powered = True
-        child_player.powered = True
         # check if we should (re)start or join a stream session
         active_queue = self.mass.player_queues.get_active_queue(parent_player.player_id)
         if active_queue.state == PlayerState.PLAYING:
@@ -482,11 +479,10 @@ class AirplayProvider(PlayerProvider):
             volume = FALLBACK_VOLUME
         mass_player = Player(
             player_id=player_id,
-            provider=self.instance_id,
+            provider=self.lookup_key,
             type=PlayerType.PLAYER,
             name=display_name,
             available=True,
-            powered=False,
             device_info=DeviceInfo(
                 model=model,
                 manufacturer=manufacturer,
@@ -499,7 +495,7 @@ class AirplayProvider(PlayerProvider):
                 PlayerFeature.VOLUME_SET,
             },
             volume_level=volume,
-            can_group_with={self.instance_id},
+            can_group_with={self.lookup_key},
             enabled_by_default=not is_broken_raop_model(manufacturer, model),
         )
         await self.mass.players.register_or_update(mass_player)
@@ -592,10 +588,10 @@ class AirplayProvider(PlayerProvider):
                 # to prevent an endless pingpong of volume changes
                 raop_volume = float(path.split("dmcp.device-volume=", 1)[-1])
                 volume = convert_airplay_volume(raop_volume)
-                assert mass_player.volume_level
+                assert mass_player.volume_level is not None
                 if (
-                    abs(mass_player.volume_level - volume) > 5
-                    or (time.time() - airplay_player.last_command_sent) < 2
+                    abs(mass_player.volume_level - volume) > 3
+                    or (time.time() - airplay_player.last_command_sent) > 3
                 ):
                     self.mass.create_task(self.cmd_volume_set(player_id, volume))
                 else:
@@ -604,10 +600,12 @@ class AirplayProvider(PlayerProvider):
             elif "dmcp.volume=" in path:
                 # volume change request from device (e.g. volume buttons)
                 volume = int(path.split("dmcp.volume=", 1)[-1])
-                if volume != mass_player.volume_level:
+                assert mass_player.volume_level is not None
+                if (
+                    abs(mass_player.volume_level - volume) > 2
+                    or (time.time() - airplay_player.last_command_sent) > 3
+                ):
                     self.mass.create_task(self.cmd_volume_set(player_id, volume))
-                    # optimistically set the new volume to prevent bouncing around
-                    mass_player.volume_level = volume
             elif "device-prevent-playback=1" in path:
                 # device switched to another source (or is powered off)
                 if raop_stream := airplay_player.raop_stream:
@@ -655,7 +653,8 @@ class AirplayProvider(PlayerProvider):
                 return
             await asyncio.sleep(0.5)
 
-        airplay_player.logger.info(
-            "Player has been in prevent playback mode for too long, powering off.",
-        )
-        await self.mass.players.cmd_power(airplay_player.player_id, False)
+        if airplay_player.raop_stream and airplay_player.raop_stream.session:
+            airplay_player.logger.info(
+                "Player has been in prevent playback mode for too long, aborting playback.",
+            )
+            await airplay_player.raop_stream.session.remove_client(airplay_player)

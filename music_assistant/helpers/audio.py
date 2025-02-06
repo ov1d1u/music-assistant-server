@@ -19,6 +19,7 @@ from music_assistant_models.enums import (
     ContentType,
     MediaType,
     PlayerFeature,
+    PlayerType,
     StreamType,
     VolumeNormalizationMode,
 )
@@ -126,8 +127,7 @@ async def crossfade_pcm_parts(
         return crossfaded_audio
     # no crossfade_data, return original data instead
     LOGGER.debug(
-        "crossfade of pcm chunks failed: not enough data? "
-        "- fade_in_part: %s - fade_out_part: %s",
+        "crossfade of pcm chunks failed: not enough data? - fade_in_part: %s - fade_out_part: %s",
         len(fade_in_part),
         len(fade_out_part),
     )
@@ -200,6 +200,9 @@ def get_player_dsp_details(
     ):
         dsp_state = DSPState.DISABLED_BY_UNSUPPORTED_GROUP
         dsp_config = DSPConfig(enabled=False)
+    elif dsp_state == DSPState.DISABLED:
+        # DSP is disabled by the user, remove all filters
+        dsp_config = DSPConfig(enabled=False)
 
     # remove disabled filters
     dsp_config.filters = [x for x in dsp_config.filters if x.enabled]
@@ -210,6 +213,7 @@ def get_player_dsp_details(
         filters=dsp_config.filters,
         output_gain=dsp_config.output_gain,
         output_limiter=dsp_config.output_limiter,
+        output_format=player.output_format,
     )
 
 
@@ -219,25 +223,49 @@ def get_stream_dsp_details(
 ) -> dict[str, DSPDetails]:
     """Return DSP details of all players playing this queue, keyed by player_id."""
     player = mass.players.get(queue_id)
-    dsp = {}
-    group_preventing_dsp: bool = False
+    dsp: dict[str, DSPDetails] = {}
+    group_preventing_dsp = is_grouping_preventing_dsp(player)
+    output_format = None
+    is_external_group = False
 
-    # We skip the PlayerGroups as they don't provide an audio output
-    # by themselves, but only sync other players.
-    if not player.provider.startswith("player_group"):
-        details = get_player_dsp_details(mass, player)
-        details.is_leader = True
-        dsp[player.player_id] = details
+    if player.provider.startswith("player_group"):
+        if group_preventing_dsp:
+            try:
+                # We need a bit of a hack here since only the leader knows the correct output format
+                provider = mass.get_provider(player.provider)
+                if provider:
+                    output_format = provider._get_sync_leader(player).output_format
+            except RuntimeError:
+                # _get_sync_leader will raise a RuntimeError if this group has no players
+                # just ignore this and continue without output_format
+                LOGGER.warning("Unable to get the sync group leader for %s", queue_id)
     else:
-        group_preventing_dsp = is_grouping_preventing_dsp(player)
+        # We only add real players (so skip the PlayerGroups as they only sync containing players)
+        details = get_player_dsp_details(mass, player)
+        dsp[player.player_id] = details
+        if group_preventing_dsp:
+            # The leader is responsible for sending the (combined) audio stream, so get
+            # the output format from the leader.
+            output_format = player.output_format
+        is_external_group = player.type in (PlayerType.GROUP, PlayerType.STEREO_PAIR)
 
-    if player and player.group_childs:
+    # We don't enumerate all group members in case this group is externally created
+    # (e.g. a Chromecast group from the Google Home app)
+    if player and player.group_childs and not is_external_group:
         # grouped playback, get DSP details for each player in the group
         for child_id in player.group_childs:
+            # skip if we already have the details (so if it's the group leader)
+            if child_id in dsp:
+                continue
             if child_player := mass.players.get(child_id):
                 dsp[child_id] = get_player_dsp_details(
                     mass, child_player, group_preventing_dsp=group_preventing_dsp
                 )
+                if group_preventing_dsp:
+                    # Use the correct format from the group leader, since
+                    # this player is part of a group that does not support
+                    # multi device DSP processing.
+                    dsp[child_id].output_format = output_format
     return dsp
 
 
@@ -385,6 +413,11 @@ async def get_media_stream(
             ffmpeg_proc.proc.pid,
         )
         async for chunk in ffmpeg_proc.iter_chunked(pcm_format.pcm_sample_size):
+            if chunk_number == 0:
+                # At this point ffmpeg has started and should now know the codec used
+                # for encoding the audio.
+                streamdetails.audio_format.codec_type = ffmpeg_proc.input_format.codec_type
+
             # for non-tracks we just yield all chunks directly
             if streamdetails.media_type != MediaType.TRACK:
                 yield chunk
@@ -510,6 +543,7 @@ async def get_media_stream(
                 VolumeNormalizationMode.FIXED_GAIN,
             )
             and (finished or (seconds_streamed >= 30))
+            and streamdetails.media_type != MediaType.PLUGIN_SOURCE
         ):
             # dynamic mode not allowed and no measurement known, we need to analyze the audio
             # add background task to start analyzing the audio
@@ -625,7 +659,7 @@ async def resolve_radio_stream(mass: MusicAssistant, url: str) -> tuple[str, Str
                 stream_type = StreamType.HLS
 
     except Exception as err:
-        LOGGER.warning("Error while parsing radio URL %s: %s", url, err)
+        LOGGER.warning("Error while parsing radio URL %s: %s", url, str(err))
         return (url, stream_type)
 
     result = (resolved_url, stream_type)
@@ -933,6 +967,9 @@ def is_grouping_preventing_dsp(player: Player) -> bool:
         # PlayerGroups have no leader, so having a child count of 1 means
         # the group actually contains only a single player.
         is_multiple_devices = child_count > 1
+    elif player.type == PlayerType.GROUP:
+        # This is an group player external to Music Assistant.
+        is_multiple_devices = True
     else:
         is_multiple_devices = child_count > 0
     return is_multiple_devices and not multi_device_dsp_supported
@@ -942,6 +979,7 @@ def get_player_filter_params(
     mass: MusicAssistant,
     player_id: str,
     input_format: AudioFormat,
+    output_format: AudioFormat,
 ) -> list[str]:
     """Get player specific filter parameters for ffmpeg (if any)."""
     filter_params = []
@@ -962,10 +1000,15 @@ def get_player_filter_params(
             # We can still apply the DSP of that single player.
             if player.group_childs:
                 child_player = mass.players.get(player.group_childs[0])
-                dsp = mass.config.get_player_dsp_config(mass, child_player)
+                dsp = mass.config.get_player_dsp_config(child_player)
             else:
                 # This should normally never happen, but if it does, we disable DSP.
                 dsp.enabled = False
+
+        # We here implicitly know what output format is used for the player
+        # in the audio processing steps. We save this information to
+        # later be able to show this to the user in the UI.
+        player.output_format = output_format
 
     if dsp.enabled:
         # Apply input gain

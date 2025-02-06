@@ -179,7 +179,7 @@ class TuneInProvider(MusicProvider):
                 name=name,
                 provider_mappings={
                     ProviderMapping(
-                        item_id=f'{details["preset_id"]}--{stream["media_type"]}',
+                        item_id=f"{details['preset_id']}--{stream['media_type']}",
                         provider_domain=self.domain,
                         provider_instance=self.instance_id,
                         audio_format=AudioFormat(
@@ -238,14 +238,12 @@ class TuneInProvider(MusicProvider):
         await self.mass.cache.set(preset_id, result, base_key=cache_base_key)
         return result
 
-    async def get_stream_details(
-        self, item_id: str, media_type: MediaType = MediaType.RADIO
-    ) -> StreamDetails:
+    async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Get streamdetails for a radio station."""
         if item_id.startswith("http"):
             # custom url
             return StreamDetails(
-                provider=self.instance_id,
+                provider=self.lookup_key,
                 item_id=item_id,
                 audio_format=AudioFormat(
                     content_type=ContentType.UNKNOWN,
@@ -253,6 +251,7 @@ class TuneInProvider(MusicProvider):
                 media_type=MediaType.RADIO,
                 stream_type=StreamType.HTTP,
                 path=item_id,
+                allow_seek=False,
                 can_seek=False,
             )
         if "--" in item_id:
@@ -264,13 +263,14 @@ class TuneInProvider(MusicProvider):
             if media_type and stream["media_type"] != media_type:
                 continue
             return StreamDetails(
-                provider=self.domain,
+                provider=self.lookup_key,
                 item_id=item_id,
                 # set contenttype to unknown so ffmpeg can auto detect it
                 audio_format=AudioFormat(content_type=ContentType.UNKNOWN),
                 media_type=MediaType.RADIO,
                 stream_type=StreamType.HTTP,
                 path=stream["url"],
+                allow_seek=False,
                 can_seek=False,
             )
         msg = f"Unable to retrieve stream details for {item_id}"

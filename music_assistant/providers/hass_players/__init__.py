@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from enum import IntFlag
 from typing import TYPE_CHECKING, Any
 
 from hass_client.exceptions import FailedCommand
@@ -34,6 +33,12 @@ from music_assistant.helpers.datetime import from_iso_string
 from music_assistant.helpers.tags import async_parse_tags
 from music_assistant.models.player_provider import PlayerProvider
 from music_assistant.providers.hass import DOMAIN as HASS_DOMAIN
+from music_assistant.providers.hass.constants import (
+    OFF_STATES,
+    UNAVAILABLE_STATES,
+    MediaPlayerEntityFeature,
+    StateMap,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -47,47 +52,9 @@ if TYPE_CHECKING:
 
     from music_assistant import MusicAssistant
     from music_assistant.models import ProviderInstanceType
-    from music_assistant.providers.hass import HomeAssistant as HomeAssistantProvider
+    from music_assistant.providers.hass import HomeAssistantProvider
 
 CONF_PLAYERS = "players"
-
-StateMap = {
-    "playing": PlayerState.PLAYING,
-    "paused": PlayerState.PAUSED,
-    "buffering": PlayerState.PLAYING,
-    "idle": PlayerState.IDLE,
-    "off": PlayerState.IDLE,
-    "standby": PlayerState.IDLE,
-    "unknown": PlayerState.IDLE,
-    "unavailable": PlayerState.IDLE,
-}
-
-
-class MediaPlayerEntityFeature(IntFlag):
-    """Supported features of the media player entity."""
-
-    PAUSE = 1
-    SEEK = 2
-    VOLUME_SET = 4
-    VOLUME_MUTE = 8
-    PREVIOUS_TRACK = 16
-    NEXT_TRACK = 32
-
-    TURN_ON = 128
-    TURN_OFF = 256
-    PLAY_MEDIA = 512
-    VOLUME_STEP = 1024
-    SELECT_SOURCE = 2048
-    STOP = 4096
-    CLEAR_PLAYLIST = 8192
-    PLAY = 16384
-    SHUFFLE_SET = 32768
-    SELECT_SOUND_MODE = 65536
-    BROWSE_MEDIA = 131072
-    REPEAT_SET = 262144
-    GROUPING = 524288
-    MEDIA_ANNOUNCE = 1048576
-    MEDIA_ENQUEUE = 2097152
 
 
 DEFAULT_PLAYER_CONFIG_ENTRIES = (
@@ -170,7 +137,7 @@ async def get_config_entries(
     player_entities: list[ConfigValueOption] = []
     if hass_prov and hass_prov.hass.connected:
         async for state in _get_hass_media_players(hass_prov):
-            name = f'{state["attributes"]["friendly_name"]} ({state["entity_id"]})'
+            name = f"{state['attributes']['friendly_name']} ({state['entity_id']})"
             player_entities.append(ConfigValueOption(name, state["entity_id"]))
     return (
         ConfigEntry(
@@ -438,11 +405,10 @@ class HomeAssistantPlayers(PlayerProvider):
 
         player = Player(
             player_id=state["entity_id"],
-            provider=self.instance_id,
+            provider=self.lookup_key,
             type=PlayerType.PLAYER,
             name=state["attributes"]["friendly_name"],
-            available=state["state"] not in ("unavailable", "unknown"),
-            powered=state["state"] not in ("unavailable", "unknown", "standby", "off"),
+            available=state["state"] not in UNAVAILABLE_STATES,
             device_info=DeviceInfo.from_dict(dev_info),
             state=StateMap.get(state["state"], PlayerState.IDLE),
             extra_data={
@@ -474,6 +440,7 @@ class HomeAssistantPlayers(PlayerProvider):
             and MediaPlayerEntityFeature.TURN_OFF in hass_supported_features
         ):
             player.supported_features.add(PlayerFeature.POWER)
+            player.powered = state["state"] not in OFF_STATES
 
         self._update_player_attributes(player, state["attributes"])
         await self.mass.players.register_or_update(player)
@@ -494,12 +461,9 @@ class HomeAssistantPlayers(PlayerProvider):
                 return
             if "s" in state:
                 player.state = StateMap.get(state["s"], PlayerState.IDLE)
-                player.powered = state["s"] not in (
-                    "unavailable",
-                    "unknown",
-                    "standby",
-                    "off",
-                )
+                player.available = state["s"] not in UNAVAILABLE_STATES
+                if PlayerFeature.POWER in player.supported_features:
+                    player.powered = state["s"] not in OFF_STATES
             if "a" in state:
                 self._update_player_attributes(player, state["a"])
             self.mass.players.update(entity_id)

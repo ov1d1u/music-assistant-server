@@ -633,7 +633,7 @@ class SlimprotoProvider(PlayerProvider):
             # player does not yet exist, create it
             player = Player(
                 player_id=player_id,
-                provider=self.instance_id,
+                provider=self.lookup_key,
                 type=PlayerType.PLAYER,
                 name=slimplayer.name,
                 available=True,
@@ -652,7 +652,7 @@ class SlimprotoProvider(PlayerProvider):
                     PlayerFeature.VOLUME_MUTE,
                     PlayerFeature.ENQUEUE,
                 },
-                can_group_with={self.instance_id},
+                can_group_with={self.lookup_key},
             )
             await self.mass.players.register_or_update(player)
 
@@ -962,10 +962,12 @@ class SlimprotoProvider(PlayerProvider):
             "Start serving multi-client flow audio stream to %s",
             child_player.display_name,
         )
-
+        output_format = AudioFormat(content_type=ContentType.try_parse(fmt))
         async for chunk in stream.get_stream(
-            output_format=AudioFormat(content_type=ContentType.try_parse(fmt)),
-            filter_params=get_player_filter_params(self.mass, child_player_id, stream.audio_format)
+            output_format=output_format,
+            filter_params=get_player_filter_params(
+                self.mass, child_player_id, stream.audio_format, output_format
+            )
             if child_player_id
             else None,
         ):

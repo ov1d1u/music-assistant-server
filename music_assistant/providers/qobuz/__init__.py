@@ -401,9 +401,7 @@ class QobuzProvider(MusicProvider):
             playlist_track_ids=",".join(playlist_track_ids),
         )
 
-    async def get_stream_details(
-        self, item_id: str, media_type: MediaType = MediaType.TRACK
-    ) -> StreamDetails:
+    async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Return the content details for the given track when it will be streamed."""
         streamdata = None
         for format_id in [27, 7, 6, 5]:
@@ -432,7 +430,7 @@ class QobuzProvider(MusicProvider):
         self.mass.create_task(self._report_playback_started(streamdata))
         return StreamDetails(
             item_id=str(item_id),
-            provider=self.instance_id,
+            provider=self.lookup_key,
             audio_format=AudioFormat(
                 content_type=content_type,
                 sample_rate=int(streamdata["sampling_rate"] * 1000),
@@ -442,6 +440,8 @@ class QobuzProvider(MusicProvider):
             duration=streamdata["duration"],
             data=streamdata,  # we need these details for reporting playback
             path=streamdata["url"],
+            can_seek=True,
+            allow_seek=True,
         )
 
     async def _report_playback_started(self, streamdata: dict) -> None:
@@ -498,7 +498,7 @@ class QobuzProvider(MusicProvider):
                     item_id=str(artist_obj["id"]),
                     provider_domain=self.domain,
                     provider_instance=self.instance_id,
-                    url=f'https://open.qobuz.com/artist/{artist_obj["id"]}',
+                    url=f"https://open.qobuz.com/artist/{artist_obj['id']}",
                 )
             },
         )
@@ -540,7 +540,7 @@ class QobuzProvider(MusicProvider):
                         sample_rate=album_obj["maximum_sampling_rate"] * 1000,
                         bit_depth=album_obj["maximum_bit_depth"],
                     ),
-                    url=f'https://open.qobuz.com/album/{album_obj["id"]}',
+                    url=f"https://open.qobuz.com/album/{album_obj['id']}",
                 )
             },
         )
@@ -604,7 +604,7 @@ class QobuzProvider(MusicProvider):
                         sample_rate=track_obj["maximum_sampling_rate"] * 1000,
                         bit_depth=track_obj["maximum_bit_depth"],
                     ),
-                    url=f'https://open.qobuz.com/track/{track_obj["id"]}',
+                    url=f"https://open.qobuz.com/track/{track_obj['id']}",
                 )
             },
             disc_number=track_obj.get("media_number", 0),
@@ -670,9 +670,13 @@ class QobuzProvider(MusicProvider):
 
     def _parse_playlist(self, playlist_obj):
         """Parse qobuz playlist object to generic layout."""
+        is_editable = (
+            playlist_obj["owner"]["id"] == self._user_auth_info["user"]["id"]
+            or playlist_obj["is_collaborative"]
+        )
         playlist = Playlist(
             item_id=str(playlist_obj["id"]),
-            provider=self.domain,
+            provider=self.instance_id if is_editable else self.lookup_key,
             name=playlist_obj["name"],
             owner=playlist_obj["owner"]["name"],
             provider_mappings={
@@ -680,13 +684,10 @@ class QobuzProvider(MusicProvider):
                     item_id=str(playlist_obj["id"]),
                     provider_domain=self.domain,
                     provider_instance=self.instance_id,
-                    url=f'https://open.qobuz.com/playlist/{playlist_obj["id"]}',
+                    url=f"https://open.qobuz.com/playlist/{playlist_obj['id']}",
                 )
             },
-        )
-        playlist.is_editable = (
-            playlist_obj["owner"]["id"] == self._user_auth_info["user"]["id"]
-            or playlist_obj["is_collaborative"]
+            is_editable=is_editable,
         )
         if img := self.__get_image(playlist_obj):
             playlist.metadata.images = [

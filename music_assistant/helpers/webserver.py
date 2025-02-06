@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     import logging
     from collections.abc import Awaitable, Callable
 
+
 MAX_CLIENT_SIZE: Final = 1024**2 * 16
 MAX_LINE_SIZE: Final = 24570
 
@@ -42,7 +43,7 @@ class Webserver:
         static_content: tuple[str, str, str] | None = None,
     ) -> None:
         """Async initialize of module."""
-        self._base_url = base_url[:-1] if base_url.endswith("/") else base_url
+        self._base_url = base_url.removesuffix("/")
         self._bind_port = bind_port
         self._static_routes = static_routes
         self._webapp = web.Application(

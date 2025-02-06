@@ -277,11 +277,10 @@ class BluesoundPlayerProvider(PlayerProvider):
 
         bluos_player.mass_player = mass_player = Player(
             player_id=self.player_id,
-            provider=self.instance_id,
+            provider=self.lookup_key,
             type=PlayerType.PLAYER,
             name=name,
             available=True,
-            powered=True,
             device_info=DeviceInfo(
                 model="BluOS speaker",
                 manufacturer="Bluesound",
@@ -295,7 +294,7 @@ class BluesoundPlayerProvider(PlayerProvider):
             },
             needs_poll=True,
             poll_interval=30,
-            can_group_with={self.instance_id},
+            can_group_with={self.lookup_key},
         )
         await self.mass.players.register(mass_player)
 

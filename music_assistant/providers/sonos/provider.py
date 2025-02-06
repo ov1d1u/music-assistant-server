@@ -9,15 +9,15 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import shortuuid
 from aiohttp import web
 from aiohttp.client_exceptions import ClientError
 from aiosonos.api.models import SonosCapability
 from aiosonos.utils import get_discovery_info
-from music_assistant_models.config_entries import ConfigEntry
-from music_assistant_models.enums import ConfigEntryType, ContentType, ProviderFeature
+from music_assistant_models.config_entries import ConfigEntry, PlayerConfig
+from music_assistant_models.enums import ConfigEntryType, ContentType, PlayerState, ProviderFeature
 from music_assistant_models.errors import PlayerCommandFailed
 from music_assistant_models.player import DeviceInfo, PlayerMedia
 from zeroconf import ServiceStateChange
@@ -38,7 +38,10 @@ from .helpers import get_primary_ip_address
 from .player import SonosPlayer
 
 if TYPE_CHECKING:
+    from music_assistant_models.queue_item import QueueItem
     from zeroconf.asyncio import AsyncServiceInfo
+
+CONF_IPS = "ips"
 
 
 class SonosPlayerProvider(PlayerProvider):
@@ -66,6 +69,34 @@ class SonosPlayerProvider(PlayerProvider):
         self.mass.streams.register_dynamic_route(
             "/sonos_queue/v2.3/timePlayed", self._handle_sonos_queue_time_played
         )
+
+    async def loaded_in_mass(self) -> None:
+        """Call after the provider has been loaded."""
+        await super().loaded_in_mass()
+
+        manual_ip_config: str | None
+        # Handle config option for manual IP's (comma separated list)
+        if (manual_ip_config := self.config.get_value(CONF_IPS)) is not None:
+            ips = manual_ip_config.split(",")
+            for raw_ip in ips:
+                # strip to ignore whitespace
+                # (e.g. '10.0.0.42, 10.0.0.43' -> ('10.0.0.42', ' 10.0.0.43'))
+                ip = raw_ip.strip()
+                if ip == "":
+                    continue
+                try:
+                    # get discovery info from SONOS speaker so we can provide an ID & other info
+                    discovery_info = await get_discovery_info(self.mass.http_session, ip)
+                except ClientError as err:
+                    self.logger.debug(
+                        "Ignoring %s (manual IP) as it is not reachable: %s", ip, str(err)
+                    )
+                    continue
+                player_id = discovery_info["device"]["id"]
+                self.sonos_players[player_id] = sonos_player = SonosPlayer(
+                    self, player_id, discovery_info=discovery_info, ip_address=ip
+                )
+                await sonos_player.setup()
 
     async def unload(self, is_removed: bool = False) -> None:
         """Handle close/cleanup of the provider."""
@@ -163,6 +194,21 @@ class SonosPlayerProvider(PlayerProvider):
             ),
         )
 
+    async def on_player_config_change(self, config: PlayerConfig, changed_keys: set[str]) -> None:
+        """Call (by config manager) when the configuration of a player changes."""
+        await super().on_player_config_change(config, changed_keys)
+        if "values/airplay_mode" in changed_keys and (
+            (sonos_player := self.sonos_players.get(config.player_id))
+            and (airplay_player := sonos_player.get_linked_airplay_player(False))
+            and airplay_player.state in (PlayerState.PLAYING, PlayerState.PAUSED)
+        ):
+            # edge case: we switched from airplay mode to sonos mode (or vice versa)
+            # we need to make sure that playback gets stopped on the airplay player
+            if airplay_prov := self.mass.get_provider(airplay_player.provider):
+                airplay_player.active_source = None
+                await airplay_prov.cmd_stop(airplay_player.player_id)
+                airplay_player.active_source = None
+
     async def cmd_stop(self, player_id: str) -> None:
         """Send STOP command to given player."""
         if sonos_player := self.sonos_players[player_id]:
@@ -177,6 +223,15 @@ class SonosPlayerProvider(PlayerProvider):
         """Send PAUSE command to given player."""
         if sonos_player := self.sonos_players[player_id]:
             await sonos_player.cmd_pause()
+
+    async def cmd_seek(self, player_id: str, position: int) -> None:
+        """Handle SEEK command for given player.
+
+        - player_id: player_id of the player to handle the command.
+        - position: position in seconds to seek to in the current playing item.
+        """
+        if sonos_player := self.sonos_players[player_id]:
+            await sonos_player.cmd_seek(position)
 
     async def cmd_volume_set(self, player_id: str, volume_level: int) -> None:
         """Send VOLUME_SET command to given player."""
@@ -207,6 +262,12 @@ class SonosPlayerProvider(PlayerProvider):
             airplay_child_ids = [x for x in child_player_ids if x.startswith("ap")]
             child_player_ids = [x for x in child_player_ids if x not in airplay_child_ids]
             if airplay_child_ids:
+                if (
+                    airplay_player.active_source != sonos_player.mass_player.active_source
+                    and airplay_player.state == PlayerState.PLAYING
+                ):
+                    # edge case player is not playing a MA queue - fail this request
+                    raise PlayerCommandFailed("Player is not playing a Music Assistant queue.")
                 await self.mass.players.cmd_group_many(airplay_player.player_id, airplay_child_ids)
         if child_player_ids:
             await sonos_player.client.player.group.modify_group_members(
@@ -324,6 +385,11 @@ class SonosPlayerProvider(PlayerProvider):
         duration = media_info.duration or 10
         await asyncio.sleep(duration)
 
+    async def select_source(self, player_id: str, source: str) -> None:
+        """Handle SELECT SOURCE command on given player."""
+        if sonos_player := self.sonos_players[player_id]:
+            await sonos_player.select_source(source)
+
     async def _setup_player(self, player_id: str, name: str, info: AsyncServiceInfo) -> None:
         """Handle setup of a new player that is discovered using mdns."""
         assert player_id not in self.sonos_players
@@ -350,6 +416,10 @@ class SonosPlayerProvider(PlayerProvider):
             self, player_id, discovery_info=discovery_info, ip_address=address
         )
         await sonos_player.setup()
+        # trigger update on all existing players to update the group status
+        for _player in self.sonos_players.values():
+            if _player.player_id != player_id:
+                _player.on_player_event(None)
 
     async def _handle_sonos_queue_itemwindow(self, request: web.Request) -> web.Response:
         """
@@ -382,51 +452,7 @@ class SonosPlayerProvider(PlayerProvider):
             sonos_player_id, CONF_ENTRY_ENFORCE_MP3.key, CONF_ENTRY_ENFORCE_MP3.default_value
         )
         sonos_queue_items = [
-            {
-                "id": item.queue_item_id,
-                "deleted": not item.media_item.available,
-                "policies": {},
-                "track": {
-                    "type": "track",
-                    "mediaUrl": self.mass.streams.resolve_stream_url(
-                        item, output_codec=ContentType.MP3 if enforce_mp3 else ContentType.FLAC
-                    ),
-                    "contentType": "audio/flac",
-                    "service": {
-                        "name": "Music Assistant",
-                        "id": "8",
-                        "accountId": "",
-                        "objectId": item.queue_item_id,
-                    },
-                    "name": item.name,
-                    "imageUrl": self.mass.metadata.get_image_url(
-                        item.image, prefer_proxy=False, image_format="jpeg"
-                    )
-                    if item.image
-                    else None,
-                    "durationMillis": item.duration * 1000 if item.duration else None,
-                    "artist": {
-                        "name": artist_str,
-                    }
-                    if item.media_item
-                    and (artist_str := getattr(item.media_item, "artist_str", None))
-                    else None,
-                    "album": {
-                        "name": album.name,
-                    }
-                    if item.media_item and (album := getattr(item.media_item, "album", None))
-                    else None,
-                    "quality": {
-                        "bitDepth": item.streamdetails.audio_format.bit_depth,
-                        "sampleRate": item.streamdetails.audio_format.sample_rate,
-                        "codec": item.streamdetails.audio_format.content_type.value,
-                        "lossless": item.streamdetails.audio_format.content_type.is_lossless(),
-                    }
-                    if item.streamdetails
-                    else None,
-                },
-            }
-            for item in queue_items
+            self._parse_sonos_queue_item(item, enforce_mp3) for item in queue_items
         ]
         result = {
             "includesBeginningOfQueue": offset == 0,
@@ -481,8 +507,8 @@ class SonosPlayerProvider(PlayerProvider):
                 },
             },
             "reports": {
-                "sendUpdateAfterMillis": 0,
-                "periodicIntervalMillis": 10000,
+                "sendUpdateAfterMillis": 1000,
+                "periodicIntervalMillis": 30000,
                 "sendPlaybackActions": True,
             },
             "playbackPolicies": {
@@ -513,20 +539,64 @@ class SonosPlayerProvider(PlayerProvider):
         sonos_player_id = sonos_playback_id.split(":")[0]
         if not (mass_player := self.mass.players.get(sonos_player_id)):
             return web.Response(status=501)
-        if not (sonos_player := self.sonos_players.get(sonos_player_id)):
+        if not (self.sonos_players.get(sonos_player_id)):
             return web.Response(status=501)
         for item in json_body["items"]:
-            if item["queueVersion"] != sonos_player.queue_version:
-                continue
             if item["type"] != "update":
                 continue
             if "positionMillis" not in item:
                 continue
-            mass_player.current_media = PlayerMedia(
-                uri=item["mediaUrl"], queue_id=sonos_playback_id, queue_item_id=item["id"]
-            )
-            mass_player.elapsed_time = item["positionMillis"] / 1000
-            mass_player.elapsed_time_last_updated = time.time()
-            self.mass.players.update(sonos_player_id)
+            if mass_player.current_media and mass_player.current_media.queue_item_id == item["id"]:
+                mass_player.elapsed_time = item["positionMillis"] / 1000
+                mass_player.elapsed_time_last_updated = time.time()
             break
         return web.Response(status=204)
+
+    def _parse_sonos_queue_item(self, queue_item: QueueItem, enforce_mp3: bool) -> dict[str, Any]:
+        """Parse a Sonos queue item to a PlayerMedia object."""
+        available = queue_item.media_item.available if queue_item.media_item else True
+        return {
+            "id": queue_item.queue_item_id,
+            "deleted": not available,
+            "policies": {},
+            "track": {
+                "type": "track",
+                "mediaUrl": self.mass.streams.resolve_stream_url(
+                    queue_item, output_codec=ContentType.MP3 if enforce_mp3 else ContentType.FLAC
+                ),
+                "contentType": "audio/flac",
+                "service": {
+                    "name": "Music Assistant",
+                    "id": "8",
+                    "accountId": "",
+                    "objectId": queue_item.queue_item_id,
+                },
+                "name": queue_item.media_item.name if queue_item.media_item else queue_item.name,
+                "imageUrl": self.mass.metadata.get_image_url(
+                    queue_item.image, prefer_proxy=False, image_format="jpeg"
+                )
+                if queue_item.image
+                else None,
+                "durationMillis": queue_item.duration * 1000 if queue_item.duration else None,
+                "artist": {
+                    "name": artist_str,
+                }
+                if queue_item.media_item
+                and (artist_str := getattr(queue_item.media_item, "artist_str", None))
+                else None,
+                "album": {
+                    "name": album.name,
+                }
+                if queue_item.media_item
+                and (album := getattr(queue_item.media_item, "album", None))
+                else None,
+                "quality": {
+                    "bitDepth": queue_item.streamdetails.audio_format.bit_depth,
+                    "sampleRate": queue_item.streamdetails.audio_format.sample_rate,
+                    "codec": queue_item.streamdetails.audio_format.content_type.value,
+                    "lossless": queue_item.streamdetails.audio_format.content_type.is_lossless(),
+                }
+                if queue_item.streamdetails
+                else None,
+            },
+        }

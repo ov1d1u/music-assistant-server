@@ -427,29 +427,32 @@ class DeezerProvider(MusicProvider):
         ]["data"][:limit]
         return [await self.get_track(track["SNG_ID"]) for track in tracks]
 
-    async def get_stream_details(
-        self, item_id: str, media_type: MediaType = MediaType.TRACK
-    ) -> StreamDetails:
+    async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Return the content details for the given track when it will be streamed."""
         url_details, song_data = await self.gw_client.get_deezer_track_urls(item_id)
         url = url_details["sources"][0]["url"]
         return StreamDetails(
             item_id=item_id,
-            provider=self.instance_id,
+            provider=self.lookup_key,
             audio_format=AudioFormat(
                 content_type=ContentType.try_parse(url_details["format"].split("_")[0])
             ),
             stream_type=StreamType.CUSTOM,
             duration=int(song_data["DURATION"]),
-            data={"url": url, "format": url_details["format"]},
+            # Due to track replacement, the track ID of the stream may be different from the ID
+            # that is stored. We need the proper track ID to decrypt the stream, so store it
+            # separately so we can use it later on.
+            data={"url": url, "format": url_details["format"], "track_id": song_data["SNG_ID"]},
             size=int(song_data[f"FILESIZE_{url_details['format']}"]),
+            can_seek=True,
+            allow_seek=True,
         )
 
     async def get_audio_stream(
         self, streamdetails: StreamDetails, seek_position: int = 0
     ) -> AsyncGenerator[bytes, None]:
         """Return the audio stream for the provider item."""
-        blowfish_key = self.get_blowfish_key(streamdetails.item_id)
+        blowfish_key = self.get_blowfish_key(streamdetails.data["track_id"])
         chunk_index = 0
         timeout = ClientTimeout(total=0, connect=30, sock_read=600)
         headers = {}
@@ -553,7 +556,7 @@ class DeezerProvider(MusicProvider):
         """Parse the deezer-python artist to a Music Assistant artist."""
         return Artist(
             item_id=str(artist.id),
-            provider=self.domain,
+            provider=self.lookup_key,
             name=artist.name,
             media_type=MediaType.ARTIST,
             provider_mappings={
@@ -570,15 +573,15 @@ class DeezerProvider(MusicProvider):
     def parse_album(self, album: deezer.Album) -> Album:
         """Parse the deezer-python album to a Music Assistant album."""
         return Album(
-            album_type=AlbumType(album.type),
+            album_type=self.get_album_type(album),
             item_id=str(album.id),
-            provider=self.domain,
+            provider=self.lookup_key,
             name=album.title,
             artists=[
                 ItemMapping(
                     media_type=MediaType.ARTIST,
                     item_id=str(album.artist.id),
-                    provider=self.instance_id,
+                    provider=self.lookup_key,
                     name=album.artist.name,
                 )
             ],
@@ -597,9 +600,10 @@ class DeezerProvider(MusicProvider):
     def parse_playlist(self, playlist: deezer.Playlist) -> Playlist:
         """Parse the deezer-python playlist to a Music Assistant playlist."""
         creator = self.get_playlist_creator(playlist)
+        is_editable = creator.id == self.user.id
         return Playlist(
             item_id=str(playlist.id),
-            provider=self.domain,
+            provider=self.instance_id if is_editable else self.lookup_key,
             name=playlist.title,
             media_type=MediaType.PLAYLIST,
             provider_mappings={
@@ -620,7 +624,7 @@ class DeezerProvider(MusicProvider):
                     )
                 ],
             ),
-            is_editable=creator.id == self.user.id,
+            is_editable=is_editable,
             owner=creator.name,
             cache_checksum=playlist.checksum,
         )
@@ -637,7 +641,7 @@ class DeezerProvider(MusicProvider):
             artist = ItemMapping(
                 media_type=MediaType.ARTIST,
                 item_id=str(getattr(track.artist, "id", f"deezer-{track.artist.name}")),
-                provider=self.instance_id,
+                provider=self.lookup_key,
                 name=track.artist.name,
             )
         else:
@@ -646,7 +650,7 @@ class DeezerProvider(MusicProvider):
             album = ItemMapping(
                 media_type=MediaType.ALBUM,
                 item_id=str(track.album.id),
-                provider=self.instance_id,
+                provider=self.lookup_key,
                 name=track.album.title,
             )
         else:
@@ -654,7 +658,7 @@ class DeezerProvider(MusicProvider):
 
         item = Track(
             item_id=str(track.id),
-            provider=self.domain,
+            provider=self.lookup_key,
             name=track.title,
             sort_name=self.get_short_title(track),
             duration=track.duration,
@@ -670,7 +674,7 @@ class DeezerProvider(MusicProvider):
                 )
             },
             metadata=self.parse_metadata_track(track=track),
-            track_number=position,
+            track_number=getattr(track, "track_position", position),
             position=position,
             disc_number=getattr(track, "disk_number", 0),
         )
@@ -683,6 +687,23 @@ class DeezerProvider(MusicProvider):
         if hasattr(track, "title_short"):
             return track.title_short
         return track.title
+
+    def get_album_type(self, album: deezer.Album) -> AlbumType:
+        """Read and convert the Deezer album type."""
+        if not hasattr(album, "record_type"):
+            return AlbumType.UNKNOWN
+
+        match album.record_type:
+            case "album":
+                return AlbumType.ALBUM
+            case "single":
+                return AlbumType.SINGLE
+            case "ep":
+                return AlbumType.EP
+            case "compile":
+                return AlbumType.COMPILATION
+            case _:
+                return AlbumType.UNKNOWN
 
     ### SEARCH AND PARSE FUNCTIONS ###
     async def search_and_parse_tracks(

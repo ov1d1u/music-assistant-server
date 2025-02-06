@@ -118,9 +118,7 @@ class OpenSonicProvider(MusicProvider):
                 raise CredentialError
         except (AuthError, CredentialError) as e:
             msg = (
-                "Failed to connect to "
-                f"{self.config.get_value(CONF_BASE_URL)}"
-                ", check your settings."
+                f"Failed to connect to {self.config.get_value(CONF_BASE_URL)}, check your settings."
             )
             raise LoginFailed(msg) from e
         self._enable_podcasts = bool(self.config.get_value(CONF_ENABLE_PODCASTS))
@@ -490,7 +488,7 @@ class OpenSonicProvider(MusicProvider):
             album: SonicAlbum | None = None
             for entry in results["songs"]:
                 if album is None or album.item_id != entry.parent:
-                    album = await self._run_async(self.get_album, prov_album_id=entry.parent)
+                    album = await self.get_album(prov_album_id=entry.parent)
                 yield self._parse_track(entry, album=album)
             offset += count
             results = await self._run_async(
@@ -572,7 +570,7 @@ class OpenSonicProvider(MusicProvider):
         except (ParameterError, DataNotFoundError) as e:
             msg = f"Item {prov_track_id} not found"
             raise MediaNotFoundError(msg) from e
-        album: SonicAlbum = await self._run_async(self.get_album, prov_album_id=sonic_song.parent)
+        album: SonicAlbum = await self.get_album(prov_album_id=sonic_song.parent)
         return self._parse_track(sonic_song, album=album)
 
     async def get_artist_albums(self, prov_artist_id: str) -> list[Album]:
@@ -665,7 +663,7 @@ class OpenSonicProvider(MusicProvider):
         album: SonicAlbum | None = None
         for index, sonic_song in enumerate(sonic_playlist.songs, 1):
             if not album or album.item_id != sonic_song.parent:
-                album = await self._run_async(self.get_album, prov_album_id=sonic_song.parent)
+                album = await self.get_album(prov_album_id=sonic_song.parent)
             track = self._parse_track(sonic_song, album=album)
             track.position = index
             result.append(track)
@@ -734,9 +732,7 @@ class OpenSonicProvider(MusicProvider):
             msg = f"Failed to remove songs from {prov_playlist_id}, check your permissions."
             raise ProviderPermissionDenied(msg) from ex
 
-    async def get_stream_details(
-        self, item_id: str, media_type: MediaType = MediaType.TRACK
-    ) -> StreamDetails:
+    async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Get the details needed to process a specified track."""
         item: SonicSong | SonicEpisode
         if media_type == MediaType.TRACK:
@@ -753,7 +749,6 @@ class OpenSonicProvider(MusicProvider):
                 item.content_type,
             )
 
-            self.mass.create_task(self._report_playback_started(item_id))
         elif media_type == MediaType.PODCAST_EPISODE:
             item = await self._get_podcast_episode(item_id)
 
@@ -762,13 +757,20 @@ class OpenSonicProvider(MusicProvider):
                 item.id,
                 item.content_type,
             )
-            self.mass.create_task(self._report_playback_started(item.id))
         else:
             msg = f"Unsupported media type encountered '{media_type}'"
             raise UnsupportedFeaturedException(msg)
 
         mime_type = item.content_type
-        if mime_type.endswith("mpeg"):
+        # For mp4 or m4a files, better to let ffmpeg detect the codec in use so mark them unknown
+        if mime_type.endswith("mp4"):
+            self.logger.warning(
+                "Due to the streaming method used by the subsonic API, M4A files "
+                "may fail. See provider documentation for more information."
+            )
+            mime_type = "?"
+        # For mp3 files, ffmpeg wants to be told 'mp3' instead of 'audio/mpeg'
+        elif mime_type.endswith("mpeg"):
             mime_type = item.suffix
 
         return StreamDetails(
@@ -781,10 +783,6 @@ class OpenSonicProvider(MusicProvider):
             stream_type=StreamType.CUSTOM,
             duration=item.duration if item.duration else 0,
         )
-
-    async def _report_playback_started(self, item_id: str) -> None:
-        self.logger.debug("scrobble for now playing called for %s", item_id)
-        await self._run_async(self._conn.scrobble, sid=item_id, submission=False)
 
     async def on_played(
         self,
@@ -806,8 +804,8 @@ class OpenSonicProvider(MusicProvider):
         When fully_played is set to false and position is 0,
         the user marked the item as unplayed in the UI.
         """
-        self.logger.debug("scrobble for listen count called for %s", item_id)
-        await self._run_async(self._conn.scrobble, sid=item_id, submission=True)
+        # Leave this function as the place where we will create a bookmark for podcasts when they
+        # are stopped early and delete the bookmark when they are finished.
 
     async def get_audio_stream(
         self, streamdetails: StreamDetails, seek_position: int = 0

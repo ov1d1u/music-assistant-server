@@ -211,9 +211,7 @@ class SiriusXMProvider(MusicProvider):
 
         return self._parse_radio(self._channels_by_id[prov_radio_id])
 
-    async def get_stream_details(
-        self, item_id: str, media_type: MediaType = MediaType.RADIO
-    ) -> StreamDetails:
+    async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Get streamdetails for a track/radio."""
         # There's a chance that the SiriusXM auth session has expired
         # by the time the user clicks to play a station.  The sxm-client
@@ -232,7 +230,7 @@ class SiriusXMProvider(MusicProvider):
         # See `_channel_updated` for where this is handled.
         self._current_stream_details = StreamDetails(
             item_id=item_id,
-            provider=self.instance_id,
+            provider=self.lookup_key,
             audio_format=AudioFormat(
                 content_type=ContentType.AAC,
             ),
@@ -240,6 +238,7 @@ class SiriusXMProvider(MusicProvider):
             media_type=MediaType.RADIO,
             path=hls_path,
             can_seek=False,
+            allow_seek=False,
         )
 
         return self._current_stream_details
@@ -287,7 +286,7 @@ class SiriusXMProvider(MusicProvider):
 
     def _parse_radio(self, channel: XMChannel) -> Radio:
         radio = Radio(
-            provider=self.instance_id,
+            provider=self.lookup_key,
             item_id=channel.id,
             name=channel.name,
             provider_mappings={
@@ -309,7 +308,7 @@ class SiriusXMProvider(MusicProvider):
         if icon is not None:
             images.append(
                 MediaItemImage(
-                    provider=self.instance_id,
+                    provider=self.lookup_key,
                     type=ImageType.THUMB,
                     path=icon,
                     remotely_accessible=True,
@@ -317,7 +316,7 @@ class SiriusXMProvider(MusicProvider):
             )
             images.append(
                 MediaItemImage(
-                    provider=self.instance_id,
+                    provider=self.lookup_key,
                     type=ImageType.LOGO,
                     path=icon,
                     remotely_accessible=True,
@@ -327,7 +326,7 @@ class SiriusXMProvider(MusicProvider):
         if banner is not None:
             images.append(
                 MediaItemImage(
-                    provider=self.instance_id,
+                    provider=self.lookup_key,
                     type=ImageType.BANNER,
                     path=banner,
                     remotely_accessible=True,
@@ -335,7 +334,7 @@ class SiriusXMProvider(MusicProvider):
             )
             images.append(
                 MediaItemImage(
-                    provider=self.instance_id,
+                    provider=self.lookup_key,
                     type=ImageType.LANDSCAPE,
                     path=banner,
                     remotely_accessible=True,

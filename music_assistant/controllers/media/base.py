@@ -26,11 +26,7 @@ from music_assistant_models.media_items import (
     Track,
 )
 
-from music_assistant.constants import (
-    DB_TABLE_PLAYLOG,
-    DB_TABLE_PROVIDER_MAPPINGS,
-    MASS_LOGGER_NAME,
-)
+from music_assistant.constants import DB_TABLE_PLAYLOG, DB_TABLE_PROVIDER_MAPPINGS, MASS_LOGGER_NAME
 from music_assistant.helpers.compare import compare_media_item
 from music_assistant.helpers.json import json_loads, serialize_to_json
 
@@ -177,7 +173,7 @@ class MediaControllerBase(Generic[ItemCls, LibraryUpdate], metaclass=ABCMeta):
         )
         return library_item
 
-    async def remove_item_from_library(self, item_id: str | int) -> None:
+    async def remove_item_from_library(self, item_id: str | int, recursive: bool = True) -> None:
         """Delete library record from the database."""
         db_id = int(item_id)  # ensure integer
         library_item = await self.get_library_item(db_id)
@@ -739,7 +735,7 @@ class MediaControllerBase(Generic[ItemCls, LibraryUpdate], metaclass=ABCMeta):
         query_parts = [x[5:] if x.lower().startswith("where ") else x for x in query_parts]
         # concetenate all join and/or where queries
         if join_parts:
-            sql_query += f' {" ".join(join_parts)} '
+            sql_query += f" {' '.join(join_parts)} "
         if query_parts:
             sql_query += " WHERE " + " AND ".join(query_parts)
         # build final query

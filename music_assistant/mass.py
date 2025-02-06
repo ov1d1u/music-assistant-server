@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 from collections.abc import Awaitable, Callable, Coroutine
-from typing import TYPE_CHECKING, Any, Self, TypeGuard, TypeVar
+from typing import TYPE_CHECKING, Any, Self, TypeGuard, TypeVar, cast
 from uuid import uuid4
 
 import aiofiles
@@ -65,7 +66,7 @@ rmfile = wrap(os.remove)
 listdir = wrap(os.listdir)
 rename = wrap(os.rename)
 
-EventCallBackType = Callable[[MassEvent], None]
+EventCallBackType = Callable[[MassEvent], None] | Coroutine[MassEvent, Any, None]
 EventSubscriptionType = tuple[
     EventCallBackType, tuple[EventType, ...] | None, tuple[str, ...] | None
 ]
@@ -134,7 +135,6 @@ class MusicAssistant:
             loop=self.loop,
             connector=TCPConnector(
                 ssl=False,
-                enable_cleanup_closed=True,
                 limit=4096,
                 limit_per_host=100,
             ),
@@ -289,6 +289,11 @@ class MusicAssistant:
         if self.closing:
             return
 
+        if ENABLE_DEBUG and not isinstance(threading.current_thread(), threading._MainThread):  # type: ignore[attr-defined]
+            raise RuntimeError(
+                "Non-Async operation detected: This method may only be called from the eventloop."
+            )
+
         if LOGGER.isEnabledFor(VERBOSE_LOG_LEVEL):
             # do not log queue time updated events because that is too chatty
             LOGGER.getChild("event").log(VERBOSE_LOG_LEVEL, "%s %s", event.value, object_id or "")
@@ -300,8 +305,12 @@ class MusicAssistant:
             if not (id_filter is None or object_id in id_filter):
                 continue
             if asyncio.iscoroutinefunction(cb_func):
-                asyncio.run_coroutine_threadsafe(cb_func(event_obj), self.loop)
+                if TYPE_CHECKING:
+                    cb_func = cast(Coroutine[Any, Any, None], cb_func)
+                self.create_task(cb_func, event_obj)
             else:
+                if TYPE_CHECKING:
+                    cb_func = cast(Callable[[MassEvent], None], cb_func)
                 self.loop.call_soon_threadsafe(cb_func, event_obj)
 
     def subscribe(
@@ -331,12 +340,12 @@ class MusicAssistant:
 
     def create_task(
         self,
-        target: Coroutine[Any, Any, _R] | Awaitable[_R] | Callable[..., _R],
+        target: Coroutine[Any, Any, _R] | Awaitable[_R],
         *args: Any,
         task_id: str | None = None,
         abort_existing: bool = False,
         **kwargs: Any,
-    ) -> asyncio.Task[_R] | asyncio.Future[_R]:
+    ) -> asyncio.Task[_R]:
         """Create Task on (main) event loop from Coroutine(function).
 
         Tasks created by this helper will be properly cancelled on stop.
@@ -347,6 +356,11 @@ class MusicAssistant:
                 existing.cancel()
             else:
                 return existing
+        if ENABLE_DEBUG and not isinstance(threading.current_thread(), threading._MainThread):  # type: ignore[attr-defined]
+            raise RuntimeError(
+                "Non-Async operation detected: This method may only be called from the eventloop."
+            )
+
         if asyncio.iscoroutinefunction(target):
             # coroutine function
             task = self.loop.create_task(target(*args, **kwargs))
@@ -354,7 +368,7 @@ class MusicAssistant:
             # coroutine
             task = self.loop.create_task(target)
         elif callable(target):
-            task = self.loop.create_task(asyncio.to_thread(target, *args, **kwargs))
+            raise RuntimeError("Function is not a coroutine or coroutine function")
         else:
             raise RuntimeError("Target is missing")
 
@@ -401,11 +415,25 @@ class MusicAssistant:
         if existing := self._tracked_timers.get(task_id):
             existing.cancel()
 
-        def _create_task() -> None:
-            self._tracked_timers.pop(task_id)
-            self.create_task(target, *args, task_id=task_id, abort_existing=True, **kwargs)
+        if ENABLE_DEBUG and not isinstance(threading.current_thread(), threading._MainThread):  # type: ignore[attr-defined]
+            raise RuntimeError(
+                "Non-Async operation detected: This method may only be called from the eventloop."
+            )
 
-        handle = self.loop.call_later(delay, _create_task)
+        def _create_task(_target: Coroutine[Any, Any, _R]) -> None:
+            self._tracked_timers.pop(task_id)
+            self.create_task(_target, *args, task_id=task_id, abort_existing=True, **kwargs)
+
+        if asyncio.iscoroutinefunction(target) or asyncio.iscoroutine(target):
+            # coroutine function
+            if TYPE_CHECKING:
+                target = cast(Coroutine[Any, Any, _R], target)
+            handle = self.loop.call_later(delay, _create_task, target)
+        else:
+            # regular callable
+            if TYPE_CHECKING:
+                target = cast(Callable[..., _R], target)
+            handle = self.loop.call_later(delay, target, *args)
         self._tracked_timers[task_id] = handle
         return handle
 
@@ -540,7 +568,9 @@ class MusicAssistant:
             try:
                 await provider.unload(is_removed)
             except Exception as err:
-                LOGGER.warning("Error while unload provider %s: %s", provider.name, str(err))
+                LOGGER.warning(
+                    "Error while unloading provider %s: %s", provider.name, str(err), exc_info=err
+                )
             finally:
                 self._providers.pop(instance_id, None)
                 await self._update_available_providers_cache()
@@ -665,6 +695,11 @@ class MusicAssistant:
                         icon_path = os.path.join(provider_path, "icon_dark.svg")
                         if await isfile(icon_path):
                             provider_manifest.icon_svg_dark = await get_icon_string(icon_path)
+                    # check for icon_monochrome file
+                    if not provider_manifest.icon_svg_monochrome:
+                        icon_path = os.path.join(provider_path, "icon_monochrome.svg")
+                        if await isfile(icon_path):
+                            provider_manifest.icon_svg_monochrome = await get_icon_string(icon_path)
                     self._provider_manifests[provider_manifest.domain] = provider_manifest
                     LOGGER.debug("Loaded manifest for provider %s", provider_manifest.name)
                 except Exception as exc:

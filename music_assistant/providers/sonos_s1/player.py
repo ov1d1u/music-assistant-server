@@ -301,13 +301,13 @@ class SonosPlayer:
     ) -> None:
         """Sync given players/speakers with this player."""
         async with self.sonos_prov.topology_condition:
-            group: list[SonosPlayer] = await self.mass.create_task(self._join, members)
+            group: list[SonosPlayer] = await asyncio.to_thread(self._join, members)
             await self.wait_for_groups([group])
 
     async def unjoin(self) -> None:
         """Unjoin player from all/any groups."""
         async with self.sonos_prov.topology_condition:
-            await self.mass.create_task(self._unjoin)
+            await asyncio.to_thread(self._unjoin)
             await self.wait_for_groups([[self]])
 
     def update_player(self, signal_update: bool = True) -> None:
@@ -530,7 +530,7 @@ class SonosPlayer:
             if group:
                 assert isinstance(group, str)
                 return group.split(",")
-            return await self.mass.create_task(_get_soco_group)
+            return await asyncio.to_thread(_get_soco_group)
 
         def _regroup(group: list[str]) -> None:
             """Rebuild internal group layout (async safe)."""
@@ -622,24 +622,13 @@ class SonosPlayer:
         self.mass_player.available = self.available
 
         if not self.available:
-            self.mass_player.powered = False
             self.mass_player.state = PlayerState.IDLE
             self.mass_player.synced_to = None
             self.mass_player.group_childs.clear()
             return
 
         # transport info (playback state)
-        self.mass_player.state = current_state = _convert_state(self.playback_status)
-
-        # power 'on' player if we detect its playing
-        if not self.mass_player.powered and (
-            current_state == PlayerState.PLAYING
-            or (
-                self.sync_coordinator
-                and self.sync_coordinator.mass_player.state == PlayerState.PLAYING
-            )
-        ):
-            self.mass_player.powered = True
+        self.mass_player.state = _convert_state(self.playback_status)
 
         # media info (track info)
         self.mass_player.current_item_id = self.uri

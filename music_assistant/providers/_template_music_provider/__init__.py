@@ -368,9 +368,7 @@ class MyDemoMusicprovider(MusicProvider):
         # Get a list of similar tracks based on the provided track.
         # This is only called if the provider supports the SIMILAR_TRACKS feature.
 
-    async def get_stream_details(
-        self, item_id: str, media_type: MediaType = MediaType.TRACK
-    ) -> StreamDetails:
+    async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Get streamdetails for a track/radio."""
         # Get stream details for a track or radio.
         # Implementing this method is MANDATORY to allow playback.
@@ -394,6 +392,10 @@ class MyDemoMusicprovider(MusicProvider):
             stream_type=StreamType.HTTP,
             # explore the StreamDetails model and StreamType enum for more options
             # but the above should be the mandatory fields to set.
+            allow_seek=True,
+            # set allow_seek to True if the stream may be seeked
+            can_seek=True,
+            # set can_seek to True if the stream supports seeking
         )
 
     async def get_audio_stream(

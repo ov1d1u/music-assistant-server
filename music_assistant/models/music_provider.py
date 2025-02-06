@@ -310,9 +310,7 @@ class MusicProvider(Provider):
         if ProviderFeature.SIMILAR_TRACKS in self.supported_features:
             raise NotImplementedError
 
-    async def get_stream_details(
-        self, item_id: str, media_type: MediaType = MediaType.TRACK
-    ) -> StreamDetails:
+    async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Get streamdetails for a track/radio/chapter/episode."""
         raise NotImplementedError
 
@@ -405,10 +403,11 @@ class MusicProvider(Provider):
         if subpath == "artists":
             library_items = await self.mass.cache.get(
                 "artist",
-                default=[],
                 category=CacheCategory.LIBRARY_ITEMS,
                 base_key=self.instance_id,
             )
+            if library_items is None:
+                return await self.mass.music.artists.library_items(provider=self.instance_id)
             library_items = cast(list[int], library_items)
             query = "artists.item_id in :ids"
             query_params = {"ids": library_items}
@@ -420,10 +419,11 @@ class MusicProvider(Provider):
         if subpath == "albums":
             library_items = await self.mass.cache.get(
                 "album",
-                default=[],
                 category=CacheCategory.LIBRARY_ITEMS,
                 base_key=self.instance_id,
             )
+            if library_items is None:
+                return await self.mass.music.albums.library_items(provider=self.instance_id)
             library_items = cast(list[int], library_items)
             query = "albums.item_id in :ids"
             query_params = {"ids": library_items}
@@ -433,10 +433,11 @@ class MusicProvider(Provider):
         if subpath == "tracks":
             library_items = await self.mass.cache.get(
                 "track",
-                default=[],
                 category=CacheCategory.LIBRARY_ITEMS,
                 base_key=self.instance_id,
             )
+            if library_items is None:
+                return await self.mass.music.tracks.library_items(provider=self.instance_id)
             library_items = cast(list[int], library_items)
             query = "tracks.item_id in :ids"
             query_params = {"ids": library_items}
@@ -446,10 +447,11 @@ class MusicProvider(Provider):
         if subpath == "radios":
             library_items = await self.mass.cache.get(
                 "radio",
-                default=[],
                 category=CacheCategory.LIBRARY_ITEMS,
                 base_key=self.instance_id,
             )
+            if library_items is None:
+                return await self.mass.music.radio.library_items(provider=self.instance_id)
             library_items = cast(list[int], library_items)
             query = "radios.item_id in :ids"
             query_params = {"ids": library_items}
@@ -459,10 +461,11 @@ class MusicProvider(Provider):
         if subpath == "playlists":
             library_items = await self.mass.cache.get(
                 "playlist",
-                default=[],
                 category=CacheCategory.LIBRARY_ITEMS,
                 base_key=self.instance_id,
             )
+            if library_items is None:
+                return await self.mass.music.playlists.library_items(provider=self.instance_id)
             library_items = cast(list[int], library_items)
             query = "playlists.item_id in :ids"
             query_params = {"ids": library_items}
@@ -472,10 +475,11 @@ class MusicProvider(Provider):
         if subpath == "audiobooks":
             library_items = await self.mass.cache.get(
                 "audiobook",
-                default=[],
                 category=CacheCategory.LIBRARY_ITEMS,
                 base_key=self.instance_id,
             )
+            if library_items is None:
+                return await self.mass.music.audiobooks.library_items(provider=self.instance_id)
             library_items = cast(list[int], library_items)
             query = "audiobooks.item_id in :ids"
             query_params = {"ids": library_items}
@@ -485,10 +489,11 @@ class MusicProvider(Provider):
         if subpath == "podcasts":
             library_items = await self.mass.cache.get(
                 "podcast",
-                default=[],
                 category=CacheCategory.LIBRARY_ITEMS,
                 base_key=self.instance_id,
             )
+            if library_items is None:
+                return await self.mass.music.podcasts.library_items(provider=self.instance_id)
             library_items = cast(list[int], library_items)
             query = "podcasts.item_id in :ids"
             query_params = {"ids": library_items}
@@ -621,8 +626,28 @@ class MusicProvider(Provider):
                         library_item = await controller.update_item_in_library(
                             library_item.item_id, prov_item
                         )
-                    elif library_item.available != prov_item.available:
+                    if library_item.available != prov_item.available:
                         # existing item availability changed
+                        library_item = await controller.update_item_in_library(
+                            library_item.item_id, prov_item
+                        )
+                    if (
+                        getattr(library_item, "resume_position_ms", None)
+                        != (resume_pos_prov := getattr(prov_item, "resume_position_ms", None))
+                        and resume_pos_prov is not None
+                    ):
+                        # resume_position_ms changed (audiobook only)
+                        library_item.resume_position_ms = resume_pos_prov
+                        library_item = await controller.update_item_in_library(
+                            library_item.item_id, prov_item
+                        )
+                    if (
+                        getattr(library_item, "fully_played", None)
+                        != (fully_played_prov := getattr(prov_item, "fully_played", None))
+                        and fully_played_prov is not None
+                    ):
+                        # fully_played changed (audiobook only)
+                        library_item.fully_played = fully_played_prov
                         library_item = await controller.update_item_in_library(
                             library_item.item_id, prov_item
                         )
@@ -655,17 +680,23 @@ class MusicProvider(Provider):
                             for x in item.provider_mappings
                             if x.provider_domain != self.domain
                         }
-                        if not remaining_providers and media_type != MediaType.ARTIST:
-                            # this item is removed from the provider's library
-                            # and we have no other providers attached to it
-                            # it is safe to remove it from the MA library too
-                            # note we skip artists here to prevent a recursive removal
-                            # of all albums and tracks underneath this artist
-                            await controller.remove_item_from_library(db_id)
-                        else:
-                            # otherwise: just unmark favorite
+                        if remaining_providers:
+                            continue
+                        # this item is removed from the provider's library
+                        # and we have no other providers attached to it
+                        # it is safe to remove it from the MA library too
+                        # note that we do not remove item's recursively on purpose
+                        try:
+                            await controller.remove_item_from_library(db_id, recursive=False)
+                        except MusicAssistantError as err:
+                            # this is probably because the item still has dependents
+                            self.logger.warning(
+                                "Error removing item %s from library: %s", db_id, str(err)
+                            )
+                            # just un-favorite the item if we can't remove it
                             await controller.set_favorite(db_id, False)
-                await asyncio.sleep(0)  # yield to eventloop
+                        await asyncio.sleep(0)  # yield to eventloop
+
             await self.mass.cache.set(
                 media_type.value,
                 list(cur_db_ids),

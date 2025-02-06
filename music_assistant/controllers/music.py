@@ -576,7 +576,7 @@ class MusicController(CoreController):
 
     @api_command("music/library/remove_item")
     async def remove_item_from_library(
-        self, media_type: MediaType, library_item_id: str | int
+        self, media_type: MediaType, library_item_id: str | int, recursive: bool = True
     ) -> None:
         """
         Remove item from the library.
@@ -593,7 +593,7 @@ class MusicController(CoreController):
                 # so we need to be a bit forgiving here
                 with suppress(NotImplementedError):
                     await prov_controller.library_remove(provider_mapping.item_id, item.media_type)
-        await ctrl.remove_item_from_library(library_item_id)
+        await ctrl.remove_item_from_library(library_item_id, recursive)
 
     @api_command("music/library/add_item")
     async def add_item_to_library(
@@ -798,13 +798,15 @@ class MusicController(CoreController):
 
         # forward to provider(s) to sync resume state (e.g. for audiobooks)
         for prov_mapping in media_item.provider_mappings:
+            if fully_played is None:
+                fully_played = True
             if music_prov := self.mass.get_provider(prov_mapping.provider_instance):
                 self.mass.create_task(
                     music_prov.on_played(
                         media_type=media_item.media_type,
                         item_id=prov_mapping.item_id,
-                        fully_played=False,
-                        position=0,
+                        fully_played=fully_played,
+                        position=seconds_played,
                     )
                 )
 
@@ -1074,7 +1076,7 @@ class MusicController(CoreController):
         self.logger.debug("Performing database cleanup...")
         # Remove playlog entries older than 90 days
         await self.database.delete_where_query(
-            DB_TABLE_PLAYLOG, f"timestamp < strftime('%s','now') - {3600 * 24  * 90}"
+            DB_TABLE_PLAYLOG, f"timestamp < strftime('%s','now') - {3600 * 24 * 90}"
         )
         # db tables cleanup
         for ctrl in (
@@ -1259,6 +1261,8 @@ class MusicController(CoreController):
         db_path = os.path.join(self.mass.storage_path, "library.db")
         await asyncio.to_thread(os.remove, db_path)
         await self._setup_database()
+        # initiate full sync
+        self.start_sync()
 
     async def __create_database_tables(self) -> None:
         """Create database tables."""
@@ -1507,13 +1511,11 @@ class MusicController(CoreController):
             )
             # index on play_count
             await self.database.execute(
-                f"CREATE INDEX IF NOT EXISTS {db_table}_play_count_idx "
-                f"on {db_table}(play_count);"
+                f"CREATE INDEX IF NOT EXISTS {db_table}_play_count_idx on {db_table}(play_count);"
             )
             # index on last_played
             await self.database.execute(
-                f"CREATE INDEX IF NOT EXISTS {db_table}_last_played_idx "
-                f"on {db_table}(last_played);"
+                f"CREATE INDEX IF NOT EXISTS {db_table}_last_played_idx on {db_table}(last_played);"
             )
 
         # indexes on provider_mappings table
