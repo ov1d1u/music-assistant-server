@@ -70,6 +70,7 @@ from .media.tracks import TracksController
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import CoreConfig
+    from music_assistant_models.media_items import Audiobook, PodcastEpisode
 
     from music_assistant.models.music_provider import MusicProvider
 
@@ -174,7 +175,8 @@ class MusicController(CoreController):
         """Cleanup on exit."""
         if self._sync_task and not self._sync_task.done():
             self._sync_task.cancel()
-        await self.database.close()
+        if self.database:
+            await self.database.close()
 
     @property
     def providers(self) -> list[MusicProvider]:
@@ -464,7 +466,35 @@ class MusicController(CoreController):
         media_types_str = "(" + ",".join(f'"{x}"' for x in media_types) + ")"
         query = (
             f"SELECT * FROM {DB_TABLE_PLAYLOG} "
-            f"WHERE media_type in {media_types_str} ORDER BY timestamp DESC"
+            f"WHERE media_type in {media_types_str} AND fully_played = 1 "
+            "ORDER BY timestamp DESC"
+        )
+        db_rows = await self.mass.music.database.get_rows_from_query(query, limit=limit)
+        result: list[ItemMapping] = []
+        available_providers = ("library", *get_global_cache_value("unique_providers", []))
+        for db_row in db_rows:
+            result.append(
+                ItemMapping.from_dict(
+                    {
+                        "item_id": db_row["item_id"],
+                        "provider": db_row["provider"],
+                        "media_type": db_row["media_type"],
+                        "name": db_row["name"],
+                        "image": json_loads(db_row["image"]) if db_row["image"] else None,
+                        "available": db_row["provider"] in available_providers,
+                    }
+                )
+            )
+        return result
+
+    @api_command("music/in_progress_items")
+    async def in_progress_items(self, limit: int = 10) -> list[ItemMapping]:
+        """Return a list of the Audiobooks and PodcastEpisodes that are in progress."""
+        query = (
+            f"SELECT * FROM {DB_TABLE_PLAYLOG} "
+            f"WHERE media_type in ('audiobook', 'podcast_episode') AND fully_played = 0 "
+            "AND seconds_played > 0 "
+            "ORDER BY timestamp DESC"
         )
         db_rows = await self.mass.music.database.get_rows_from_query(query, limit=limit)
         result: list[ItemMapping] = []
@@ -765,7 +795,7 @@ class MusicController(CoreController):
     async def mark_item_played(
         self,
         media_item: MediaItemType | ItemMapping,
-        fully_played: bool | None = None,
+        fully_played: bool = True,
         seconds_played: int | None = None,
     ) -> None:
         """Mark item as played in playlog."""
@@ -798,8 +828,6 @@ class MusicController(CoreController):
 
         # forward to provider(s) to sync resume state (e.g. for audiobooks)
         for prov_mapping in media_item.provider_mappings:
-            if fully_played is None:
-                fully_played = True
             if music_prov := self.mass.get_provider(prov_mapping.provider_instance):
                 self.mass.create_task(
                     music_prov.on_played(
@@ -810,7 +838,9 @@ class MusicController(CoreController):
                     )
                 )
 
-        # also update playcount in library table
+        # also update playcount in library table (if fully played)
+        if not fully_played:
+            return
         if not (ctrl := self.get_controller(media_item.media_type)):
             # skip non media items (e.g. plugin source)
             return
@@ -860,8 +890,46 @@ class MusicController(CoreController):
         ctrl = self.get_controller(media_item.media_type)
         db_item = await ctrl.get_library_item_by_prov_id(media_item.item_id, media_item.provider)
         if db_item:
-            await self.database.execute(f"UPDATE {ctrl.db_table} SET play_count = play_count - 1")
+            await self.database.execute(
+                f"UPDATE {ctrl.db_table} SET play_count = play_count - 1, "
+                f"last_played = 0 WHERE item_id = {db_item.item_id}"
+            )
             await self.database.commit()
+
+    async def get_resume_position(self, media_item: Audiobook | PodcastEpisode) -> tuple[bool, int]:
+        """
+        Get progress (resume point) details for the given audiobook or episode.
+
+        This is a separate call to ensure the resume position is always up-to-date
+        and because many providers have this info present on a dedicated endpoint.
+
+        Will be called right before playback starts to ensure the resume position is correct.
+
+        Returns a boolean with the fully_played status
+        and an integer with the resume position in ms.
+        """
+        for prov_mapping in media_item.provider_mappings:
+            if not (music_prov := self.mass.get_provider(prov_mapping.provider_instance)):
+                continue
+            with suppress(NotImplementedError):
+                return await music_prov.get_resume_position(
+                    prov_mapping.item_id, media_item.media_type
+                )
+        # no provider info found, fallback to library playlog
+        if db_entry := await self.mass.music.database.get_row(
+            DB_TABLE_PLAYLOG,
+            {
+                "media_type": media_item.media_type.value,
+                "item_id": media_item.item_id,
+                "provider": media_item.provider,
+            },
+        ):
+            resume_position_ms = (
+                db_entry["seconds_played"] * 1000 if db_entry["seconds_played"] else 0
+            )
+            return (db_entry["fully_played"], resume_position_ms)
+
+        return (False, 0)
 
     def get_controller(
         self, media_type: MediaType

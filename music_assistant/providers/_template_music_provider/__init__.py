@@ -354,7 +354,7 @@ class MyDemoMusicprovider(MusicProvider):
     ) -> None:
         """Remove track(s) from playlist."""
         # Remove track(s) from a playlist.
-        # This is only called if the provider supports the EDPLAYLIST_TRACKS_EDITIT feature.
+        # This is only called if the provider supports the PLAYLIST_TRACKS_EDIT feature.
 
     async def create_playlist(self, name: str) -> Playlist:  # type: ignore[empty-body]
         """Create a new playlist on provider with given name."""
@@ -367,6 +367,22 @@ class MyDemoMusicprovider(MusicProvider):
         """Retrieve a dynamic list of similar tracks based on the provided track."""
         # Get a list of similar tracks based on the provided track.
         # This is only called if the provider supports the SIMILAR_TRACKS feature.
+
+    async def get_resume_position(self, item_id: str, media_type: MediaType) -> tuple[bool, int]:  # type: ignore[empty-body]
+        """
+        Get progress (resume point) details for the given Audiobook or Podcast episode.
+
+        This is a separate call from the regular get_item call to ensure the resume position
+        is always up-to-date and because a lot providers have this info present on a dedicated
+        endpoint.
+
+        Will be called right before playback starts to ensure the resume position is correct.
+
+        Returns a boolean with the fully_played status
+        and an integer with the resume position in ms.
+        """
+        # optional function to get the resume position of a audiobook or podcast episode
+        # only implement this if your provider supports providing this information
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Get streamdetails for a track/radio."""
@@ -441,8 +457,8 @@ class MyDemoMusicprovider(MusicProvider):
 
         This is called by the Queue controller when;
             - a track has been fully played
-            - a track has been skipped
-            - a track has been stopped after being played
+            - a track has been stopped (or skipped) after being played
+            - every 30s when a track is playing
 
         Fully played is True when the track has been played to the end.
         Position is the last known position of the track in seconds, to sync resume state.
