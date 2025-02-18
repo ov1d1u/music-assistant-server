@@ -8,7 +8,9 @@ import logging
 import os
 import os.path
 import time
+import urllib.parse
 from collections.abc import AsyncGenerator, Iterator, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import aiofiles
@@ -33,7 +35,7 @@ from music_assistant_models.media_items import (
     ItemMapping,
     MediaItemChapter,
     MediaItemImage,
-    MediaItemType,
+    MediaItemTypeOrItemMapping,
     Playlist,
     Podcast,
     PodcastEpisode,
@@ -185,10 +187,8 @@ class LocalFileSystemProvider(MusicProvider):
         return False
 
     @property
-    def name(self) -> str:
-        """Return (custom) friendly name for this provider instance."""
-        if self.config.name:
-            return self.config.name
+    def default_name(self) -> str:
+        """Return default name for this provider instance."""
         postfix = self.base_path.split(os.sep)[-1]
         return f"{self.manifest.name} {postfix}"
 
@@ -247,16 +247,17 @@ class LocalFileSystemProvider(MusicProvider):
             )
         return result
 
-    async def browse(self, path: str) -> Sequence[MediaItemType | ItemMapping]:
+    async def browse(self, path: str) -> Sequence[MediaItemTypeOrItemMapping]:
         """Browse this provider's items.
 
         :param path: The path to browse, (e.g. provid://artists).
         """
-        if self.media_content_type in ("audiobooks", "podcasts"):
-            # for audiobooks and podcasts just use the default implementation
-            # so we dont have to deal with multi-part audiobooks and podcast episodes
-            return await super().browse(path)
-        items: list[MediaItemType | ItemMapping] = []
+        # for audiobooks and podcasts we just return all library items
+        if self.media_content_type == "podcasts":
+            return await self.mass.music.podcasts.library_items(provider=self.instance_id)
+        if self.media_content_type == "audiobooks":
+            return await self.mass.music.audiobooks.library_items(provider=self.instance_id)
+        items: list[MediaItemTypeOrItemMapping] = []
         item_path = path.split("://", 1)[1]
         if not item_path:
             item_path = ""
@@ -273,6 +274,8 @@ class LocalFileSystemProvider(MusicProvider):
                         provider=self.instance_id,
                         path=f"{self.instance_id}://{item.relative_path}",
                         name=item.filename,
+                        # mark folder as playable, assuming it contains tracks underneath
+                        is_playable=True,
                     )
                 )
             elif item.ext in TRACK_EXTENSIONS:
@@ -295,7 +298,7 @@ class LocalFileSystemProvider(MusicProvider):
                 )
         return items
 
-    async def sync_library(self, media_types: tuple[MediaType, ...]) -> None:
+    async def sync_library(self, media_type: MediaType) -> None:
         """Run library sync for this provider."""
         assert self.mass.music.database
         start_time = time.time()
@@ -533,9 +536,12 @@ class LocalFileSystemProvider(MusicProvider):
             prov_artist_id, self.instance_id
         )
         if not db_artist:
-            # this should not be possible, but just in case
-            msg = f"Artist not found: {prov_artist_id}"
-            raise MediaNotFoundError(msg)
+            # this may happen if the artist is not in the db yet
+            # e.g. when browsing the filesystem
+            if await self.exists(prov_artist_id):
+                return await self._parse_artist(prov_artist_id, artist_path=prov_artist_id)
+            return await self._parse_artist(prov_artist_id)
+
         # prov_artist_id is either an actual (relative) path or a name (as fallback)
         safe_artist_name = create_safe_string(prov_artist_id, lowercase=False, replace_space=False)
         if await self.exists(prov_artist_id):
@@ -673,6 +679,8 @@ class LocalFileSystemProvider(MusicProvider):
                 playlist_lines = parse_pls(playlist_data)
 
             for idx, playlist_line in enumerate(playlist_lines, 1):
+                if "#EXT" in playlist_line.path:
+                    continue
                 if track := await self._parse_playlist_line(
                     playlist_line.path, os.path.dirname(prov_playlist_id)
                 ):
@@ -718,24 +726,30 @@ class LocalFileSystemProvider(MusicProvider):
     async def _parse_playlist_line(self, line: str, playlist_path: str) -> Track | None:
         """Try to parse a track from a playlist line."""
         try:
-            # if a relative path was given in an upper level from the playlist,
-            # try to resolve it
-            for parentpart in ("../", "..\\"):
-                while line.startswith(parentpart):
-                    if len(playlist_path) < 3:
-                        break  # guard
-                    playlist_path = parentpart[:-3]
-                    line = line[3:]
-
-            # try to resolve the filename
-            for filename in (line, os.path.join(playlist_path, line)):
-                with contextlib.suppress(FileNotFoundError):
-                    file_item = await self.resolve(filename)
-                    tags = await async_parse_tags(file_item.absolute_path, file_item.file_size)
-                    return await self._parse_track(file_item, tags)
+            line = line.replace("file://", "").strip()
+            # try to resolve the filename (both normal and url decoded):
+            # - as an absolute path
+            # - relative to the playlist path
+            # - relative to our base path
+            # - relative to the playlist path with a leading slash
+            for _line in (line, urllib.parse.unquote(line)):
+                for filename in (
+                    # try to resolve the line as an absolute path
+                    _line,
+                    # try to resolve the line as a relative path to the playlist
+                    os.path.join(playlist_path, _line.removeprefix("/")),
+                    # try to resolve the line by resolving it against the absolute playlist path
+                    (Path(self.get_absolute_path(playlist_path)) / _line).resolve().as_posix(),
+                ):
+                    with contextlib.suppress(FileNotFoundError):
+                        file_item = await self.resolve(filename)
+                        tags = await async_parse_tags(file_item.absolute_path, file_item.file_size)
+                        return await self._parse_track(file_item, tags)
+            # all attempts failed
+            raise MediaNotFoundError("Invalid path/uri")
 
         except MusicAssistantError as err:
-            self.logger.warning("Could not parse uri/file %s to track: %s", line, str(err))
+            self.logger.warning("Could not parse %s to track: %s", line, str(err))
 
         return None
 

@@ -41,12 +41,16 @@ from music_assistant_models.errors import (
     UnsupportedFeaturedException,
 )
 from music_assistant_models.media_items import (
+    BrowseFolder,
+    ItemMapping,
     MediaItemType,
+    MediaItemTypeOrItemMapping,
     PlayableMediaItemType,
     Playlist,
     PodcastEpisode,
     media_from_dict,
 )
+from music_assistant_models.playback_progress_report import MediaItemPlaybackProgressReport
 from music_assistant_models.player import PlayerMedia
 from music_assistant_models.player_queue import PlayerQueue
 from music_assistant_models.queue_item import QueueItem
@@ -55,7 +59,7 @@ from music_assistant.constants import CONF_CROSSFADE, CONF_FLOW_MODE, MASS_LOGO_
 from music_assistant.helpers.api import api_command
 from music_assistant.helpers.audio import get_stream_details, get_stream_dsp_details
 from music_assistant.helpers.throttle_retry import BYPASS_THROTTLER
-from music_assistant.helpers.util import get_changed_keys
+from music_assistant.helpers.util import get_changed_keys, percentage
 from music_assistant.models.core_controller import CoreController
 
 if TYPE_CHECKING:
@@ -106,21 +110,6 @@ class CompareState(TypedDict):
     stream_title: str | None
     codec_type: ContentType | None
     output_formats: list[str] | None
-
-
-class MediaItemPlaybackProgressReport(TypedDict):
-    """Object to submit in a progress the event submitted to report media playback."""
-
-    uri: str
-    media_type: MediaType
-    name: str
-    artist: str | None
-    album: str | None
-    image_url: str | None
-    duration: int
-    mbid: str | None
-    seconds_played: int
-    fully_played: bool
 
 
 class PlayerQueuesController(CoreController):
@@ -782,8 +771,8 @@ class PlayerQueuesController(CoreController):
         queue.index_in_buffer = index
         queue.flow_mode_stream_log = []
         queue.flow_mode = await self.mass.config.get_player_config_value(queue_id, CONF_FLOW_MODE)
-        # no point in enabled flow mode for radio or plugin sources
-        if queue_item.media_type in (MediaType.RADIO, MediaType.PLUGIN_SOURCE):
+        # no point in enabling flow mode for radio sources
+        if queue_item.media_type == MediaType.RADIO:
             queue.flow_mode = False
         queue.current_item = queue_item
 
@@ -1021,6 +1010,7 @@ class PlayerQueuesController(CoreController):
             )
         )
         if queue_item.media_item and queue_item.media_item.media_type == MediaType.TRACK:
+            album = queue_item.media_item.album
             # prefer the full library media item so we have all metadata and provider(quality) info
             # always request the full library item as there might be other qualities available
             if library_item := await self.mass.music.get_library_item_by_prov_id(
@@ -1035,6 +1025,17 @@ class PlayerQueuesController(CoreController):
                 # Youtube Music has poor thumbs by default, so we always fetch the full item
                 # this also catches the case where they have an unavailable item in a listing
                 queue_item.media_item = await self.mass.music.get_item_by_uri(queue_item.uri)
+            # ensure we got the full (original) album set
+            if album and (
+                library_album := await self.mass.music.get_library_item_by_prov_id(
+                    album.media_type,
+                    album.item_id,
+                    album.provider,
+                )
+            ):
+                queue_item.media_item.album = library_album
+            else:
+                queue_item.media_item.album = album
         # Fetch the streamdetails, which could raise in case of an unplayable item.
         # For example, YT Music returns Radio Items that are not playable.
         queue_item.streamdetails = await get_stream_details(
@@ -1415,9 +1416,12 @@ class PlayerQueuesController(CoreController):
         )
 
     async def _resolve_media_items(
-        self, media_item: MediaItemType, start_item: str | None = None
+        self, media_item: MediaItemTypeOrItemMapping, start_item: str | None = None
     ) -> list[MediaItemType]:
         """Resolve/unwrap media items to enqueue."""
+        # resolve Itemmapping to full media item
+        if isinstance(media_item, ItemMapping):
+            media_item = await self.mass.music.get_item_by_uri(media_item.uri)
         if media_item.media_type == MediaType.PLAYLIST:
             self.mass.create_task(self.mass.music.mark_item_played(media_item))
             return await self.get_playlist_tracks(media_item, start_item)
@@ -1438,6 +1442,8 @@ class PlayerQueuesController(CoreController):
             return await self.get_next_podcast_episodes(media_item, start_item)
         if media_item.media_type == MediaType.PODCAST_EPISODE:
             return await self.get_next_podcast_episodes(None, media_item)
+        if media_item.media_type == MediaType.FOLDER:
+            return await self._get_folder_tracks(media_item)
         # all other: single track or radio item
         return [media_item]
 
@@ -1523,6 +1529,21 @@ class PlayerQueuesController(CoreController):
                 remaining_dynamic_tracks, min(len(remaining_dynamic_tracks), 25)
             )
         return queue_tracks
+
+    async def _get_folder_tracks(self, folder: BrowseFolder) -> list[Track]:
+        """Fetch (playable) tracks for given browse folder."""
+        self.logger.info(
+            "Fetching tracks to play for folder %s",
+            folder.name,
+        )
+        tracks: list[Track] = []
+        for item in await self.mass.music.browse(folder.path):
+            if not item.is_playable:
+                continue
+            # recursively fetch tracks from all media types
+            tracks += await self._resolve_media_items(item)
+
+        return tracks
 
     def _update_queue_from_player(
         self,
@@ -1816,45 +1837,60 @@ class PlayerQueuesController(CoreController):
         cur_item_id = new_state["current_item_id"]
         if prev_item_id is None and cur_item_id is None:
             return
+
         if prev_item_id is not None and prev_item_id != cur_item_id:
             # we have a new item, so we need report the previous one
+            is_current_item = False
             item_to_report = prev_state["current_item"]
             seconds_played = int(prev_state["elapsed_time"])
         else:
             # report on current item
+            is_current_item = True
             item_to_report = self.get_item(queue.queue_id, cur_item_id) or new_state["current_item"]
             if not item_to_report:
                 return  # guard against invalid items
             seconds_played = int(new_state["elapsed_time"])
-            if seconds_played < 10:
-                # ignore items that have been played less than 10 seconds
-                return
 
         if not item_to_report.media_item:
             # only report on media items
             return
 
         if item_to_report.streamdetails and item_to_report.streamdetails.duration:
-            duration = item_to_report.streamdetails.duration
+            duration = int(item_to_report.streamdetails.duration)
         else:
-            duration = item_to_report.duration or 3600
+            duration = int(item_to_report.duration or 3 * 3600)
+
+        if seconds_played < 5:
+            # ignore items that have been played less than 5 seconds
+            # this also filters out a bounce effect where the previous item
+            # gets reported with 0 elapsed seconds after a new item starts playing
+            return
 
         # determine if item is fully played
         # for podcasts and audiobooks we account for the last 60 seconds
-        if item_to_report.queue_item_id == prev_item_id and item_to_report.media_type in (
+        percentage_played = percentage(seconds_played, duration)
+        if not is_current_item and item_to_report.media_type in (
             MediaType.AUDIOBOOK,
             MediaType.PODCAST_EPISODE,
         ):
-            fully_played = seconds_played >= (duration or 3 * 3600) - 60
+            fully_played = seconds_played >= duration - 60
+        elif not is_current_item:
+            # 90% of the track must be played to be considered fully played
+            fully_played = percentage_played >= 90
         else:
-            fully_played = seconds_played >= (duration or 3600) - 10
+            fully_played = seconds_played >= duration - 10
 
+        is_playing = is_current_item and queue.state == PlayerState.PLAYING
         self.logger.debug(
-            "PlayerQueue %s playing/played item %s - fully_played: %s - progress: %s",
+            "%s %s '%s' (%s) - Fully played: %s - Progress: %s (%s/%ss)",
             queue.display_name,
+            "is playing" if is_playing else "played",
+            item_to_report.name,
             item_to_report.uri,
             fully_played,
+            f"{percentage_played}%",
             seconds_played,
+            duration,
         )
         # add entry to playlog - this also handles resume of podcasts/audiobooks
         self.mass.create_task(
@@ -1871,8 +1907,8 @@ class PlayerQueuesController(CoreController):
             object_id=item_to_report.media_item.uri,
             data=MediaItemPlaybackProgressReport(
                 uri=item_to_report.media_item.uri,
-                name=item_to_report.media_item.name,
                 media_type=item_to_report.media_item.media_type,
+                name=item_to_report.media_item.name,
                 artist=getattr(item_to_report.media_item, "artist_str", None),
                 album=(
                     album.name
@@ -1888,5 +1924,6 @@ class PlayerQueuesController(CoreController):
                 mbid=(getattr(item_to_report.media_item, "mbid", None)),
                 seconds_played=seconds_played,
                 fully_played=fully_played,
+                is_playing=is_playing,
             ),
         )

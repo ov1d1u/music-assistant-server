@@ -17,7 +17,7 @@ from music_assistant_models.helpers import get_global_cache_value, set_global_ca
 from music_assistant.constants import VERBOSE_LOG_LEVEL
 
 from .process import AsyncProcess, check_output
-from .util import TimedAsyncGenerator, close_async_generator
+from .util import close_async_generator
 
 if TYPE_CHECKING:
     from music_assistant_models.media_items import AudioFormat
@@ -147,7 +147,11 @@ class FFMpeg(AsyncProcess):
             # for data to arrive (e.g. when there is X amount of seconds in the buffer)
             # so this timeout is just to catch if the source is stuck and rpeort it and not
             # to recover from it.
-            async for chunk in TimedAsyncGenerator(self.audio_input, timeout=300):
+            # async for chunk in TimedAsyncGenerator(self.audio_input, timeout=300):
+            #     if self.closed:
+            #         return
+            #     await self.write(chunk)
+            async for chunk in self.audio_input:
                 if self.closed:
                     return
                 await self.write(chunk)
@@ -291,6 +295,11 @@ def get_ffmpeg_args(
             "-ac",
             str(output_format.channels),
         ]
+        if not output_format.content_type.is_pcm() and output_format.content_type.is_lossless():
+            if output_format.bit_depth == 24:
+                output_args += ["-sample_fmt", "s32"]
+            elif output_format.bit_depth == 16:
+                output_args += ["-sample_fmt", "s16"]
         if output_format.output_format_str == "flac":
             # use level 0 compression for fastest encoding
             output_args += ["-compression_level", "0"]
@@ -345,13 +354,20 @@ async def check_ffmpeg_version() -> None:
             "FFmpeg binary is missing from system. "
             "Please install ffmpeg on your OS to enable playback."
         )
+    if returncode != 0:
+        err_msg = "Error determining FFmpeg version on your system."
+        if returncode < 0:
+            # error below 0 is often illegal instruction
+            err_msg += " - Your CPU may be too old to run this version of FFmpeg."
+        err_msg += f" - Additional info: {returncode} {output.decode().strip()}"
+        raise AudioError(err_msg)
     # parse version number from output
     try:
         version = output.decode().split("ffmpeg version ")[1].split(" ")[0].split("-")[0]
     except IndexError:
         raise AudioError(
             "Error determining FFmpeg version on your system."
-            f"Additional info: {returncode} {output}"
+            f"Additional info: {returncode} {output.decode().strip()}"
         )
     libsoxr_support = "enable-libsoxr" in output.decode()
     # use globals as in-memory cache

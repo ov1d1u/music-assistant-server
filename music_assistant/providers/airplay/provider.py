@@ -17,6 +17,7 @@ from music_assistant_models.enums import (
     PlayerState,
     PlayerType,
     ProviderFeature,
+    StreamType,
 )
 from music_assistant_models.media_items import AudioFormat
 from music_assistant_models.player import DeviceInfo, Player, PlayerMedia
@@ -38,6 +39,7 @@ from music_assistant.helpers.datetime import utc
 from music_assistant.helpers.ffmpeg import get_ffmpeg_stream
 from music_assistant.helpers.util import TaskManager, get_ip_pton, lock, select_free_port
 from music_assistant.models.player_provider import PlayerProvider
+from music_assistant.models.plugin import PluginProvider
 from music_assistant.providers.airplay.raop import RaopStreamSession
 from music_assistant.providers.player_group import PlayerGroupProvider
 
@@ -59,6 +61,8 @@ from .helpers import (
     is_broken_raop_model,
 )
 from .player import AirPlayPlayer
+
+CONF_IGNORE_VOLUME = "ignore_volume"
 
 PLAYER_CONFIG_ENTRIES = (
     CONF_ENTRY_FLOW_MODE_ENFORCED,
@@ -110,6 +114,16 @@ PLAYER_CONFIG_ENTRIES = (
     ),
     # airplay has fixed sample rate/bit depth so make this config entry static and hidden
     create_sample_rates_config_entry(44100, 16, 44100, 16, True),
+    ConfigEntry(
+        key=CONF_IGNORE_VOLUME,
+        type=ConfigEntryType.BOOLEAN,
+        default_value=False,
+        label="Ignore volume reports sent by the device itself",
+        description="The Airplay protocol allows devices to report their own volume level. \n"
+        "For some devices this is not reliable and can cause unexpected volume changes. \n"
+        "Enable this option to ignore these reports.",
+        category="airplay",
+    ),
 )
 
 BROKEN_RAOP_WARN = ConfigEntry(
@@ -120,6 +134,7 @@ BROKEN_RAOP_WARN = ConfigEntry(
     label="This player is known to have broken Airplay 1 (RAOP) support. "
     "Playback may fail or simply be silent. There is no workaround for this issue at the moment.",
 )
+
 
 # TODO: Airplay provider
 # - Implement authentication for Apple TV
@@ -233,6 +248,7 @@ class AirplayProvider(PlayerProvider):
     async def get_player_config_entries(self, player_id: str) -> tuple[ConfigEntry, ...]:
         """Return all (provider/player specific) Config Entries for the given player (if any)."""
         base_entries = await super().get_player_config_entries(player_id)
+
         if player := self.mass.players.get(player_id):
             if is_broken_raop_model(player.device_info.manufacturer, player.device_info.model):
                 return (*base_entries, BROKEN_RAOP_WARN, *PLAYER_CONFIG_ENTRIES)
@@ -300,12 +316,34 @@ class AirplayProvider(PlayerProvider):
                 output_format=AIRPLAY_PCM_FORMAT,
                 use_pre_announce=media.custom_data["use_pre_announce"],
             )
+        elif media.media_type == MediaType.PLUGIN_SOURCE:
+            # special case: plugin source stream
+            # consume the stream directly, so we can skip one step in between
+            assert media.custom_data is not None  # for type checking
+            provider = cast(PluginProvider, self.mass.get_provider(media.custom_data["provider"]))
+            plugin_source = provider.get_source()
+            assert plugin_source.audio_format is not None  # for type checking
+            input_format = plugin_source.audio_format
+            audio_source = (
+                provider.get_audio_stream(player_id)  # type: ignore[assignment]
+                if plugin_source.stream_type == StreamType.CUSTOM
+                else cast(str, plugin_source.path)
+            )
         elif media.queue_id and media.queue_id.startswith("ugp_"):
             # special case: UGP stream
             ugp_provider = cast(PlayerGroupProvider, self.mass.get_provider("player_group"))
             ugp_stream = ugp_provider.ugp_streams[media.queue_id]
             input_format = ugp_stream.base_pcm_format
             audio_source = ugp_stream.subscribe_raw()
+        elif media.media_type == MediaType.RADIO and media.queue_id and media.queue_item_id:
+            # use single item stream request for radio streams
+            input_format = AIRPLAY_PCM_FORMAT
+            queue_item = self.mass.player_queues.get_item(media.queue_id, media.queue_item_id)
+            assert queue_item is not None  # for type checking
+            audio_source = self.mass.streams.get_queue_item_stream(
+                queue_item=queue_item,
+                pcm_format=AIRPLAY_PCM_FORMAT,
+            )
         elif media.queue_id and media.queue_item_id:
             # regular queue (flow) stream request
             input_format = AIRPLAY_FLOW_PCM_FORMAT
@@ -313,7 +351,7 @@ class AirplayProvider(PlayerProvider):
             assert queue
             start_queue_item = self.mass.player_queues.get_item(media.queue_id, media.queue_item_id)
             assert start_queue_item
-            audio_source = self.mass.streams.get_flow_stream(
+            audio_source = self.mass.streams.get_queue_flow_stream(
                 queue=queue,
                 start_queue_item=start_queue_item,
                 pcm_format=input_format,
@@ -548,6 +586,10 @@ class AirplayProvider(PlayerProvider):
             mass_player = self.mass.players.get(player_id)
             if not mass_player:
                 return
+            ignore_volume_report = (
+                self.mass.config.get_raw_player_config_value(player_id, CONF_IGNORE_VOLUME, False)
+                or mass_player.device_info.manufacturer.lower() == "apple"
+            )
             active_queue = self.mass.player_queues.get_active_queue(player_id)
             if path == "/ctrl-int/1/nextitem":
                 self.mass.create_task(self.mass.player_queues.next(active_queue.queue_id))
@@ -578,19 +620,16 @@ class AirplayProvider(PlayerProvider):
                 # we ignore this if the player is already playing
                 if mass_player.state == PlayerState.PLAYING:
                     self.mass.create_task(self.mass.player_queues.pause(active_queue.queue_id))
-            elif "dmcp.device-volume=" in path:
-                if mass_player.device_info.manufacturer.lower() == "apple":
-                    # Apple devices only report their previous volume level ?!
-                    return
+            elif "dmcp.device-volume=" in path and not ignore_volume_report:
                 # This is a bit annoying as this can be either the device confirming a new volume
                 # we've sent or the device requesting a new volume itself.
                 # In case of a small rounding difference, we ignore this,
                 # to prevent an endless pingpong of volume changes
                 raop_volume = float(path.split("dmcp.device-volume=", 1)[-1])
                 volume = convert_airplay_volume(raop_volume)
-                assert mass_player.volume_level is not None
+                cur_volume = mass_player.volume_level or 0
                 if (
-                    abs(mass_player.volume_level - volume) > 3
+                    abs(cur_volume - volume) > 3
                     or (time.time() - airplay_player.last_command_sent) > 3
                 ):
                     self.mass.create_task(self.cmd_volume_set(player_id, volume))
@@ -600,9 +639,9 @@ class AirplayProvider(PlayerProvider):
             elif "dmcp.volume=" in path:
                 # volume change request from device (e.g. volume buttons)
                 volume = int(path.split("dmcp.volume=", 1)[-1])
-                assert mass_player.volume_level is not None
+                cur_volume = mass_player.volume_level or 0
                 if (
-                    abs(mass_player.volume_level - volume) > 2
+                    abs(cur_volume - volume) > 2
                     or (time.time() - airplay_player.last_command_sent) > 3
                 ):
                     self.mass.create_task(self.cmd_volume_set(player_id, volume))
@@ -610,8 +649,10 @@ class AirplayProvider(PlayerProvider):
                 # device switched to another source (or is powered off)
                 if raop_stream := airplay_player.raop_stream:
                     # ignore this if we just started playing to prevent false positives
-                    assert mass_player.elapsed_time
-                    if mass_player.elapsed_time > 10 and mass_player.state == PlayerState.PLAYING:
+                    elapsed_time = (
+                        10 if mass_player.elapsed_time is None else mass_player.elapsed_time
+                    )
+                    if elapsed_time > 10 and mass_player.state == PlayerState.PLAYING:
                         raop_stream.prevent_playback = True
                         self.mass.create_task(self.monitor_prevent_playback(player_id))
             elif "device-prevent-playback=0" in path:

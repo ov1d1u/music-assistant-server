@@ -45,8 +45,8 @@ from music_assistant_models.media_items import (
     Album,
     Artist,
     AudioFormat,
-    ItemMapping,
     MediaItemType,
+    MediaItemTypeOrItemMapping,
     Playlist,
     ProviderMapping,
     Radio,
@@ -482,7 +482,7 @@ class MyDemoMusicprovider(MusicProvider):
         # to false in a MediaItemImage object.
         return path
 
-    async def browse(self, path: str) -> Sequence[MediaItemType | ItemMapping]:
+    async def browse(self, path: str) -> Sequence[MediaItemTypeOrItemMapping]:
         """Browse this provider's items.
 
         :param path: The path to browse, (e.g. provider_id://artists).
@@ -507,9 +507,9 @@ class MyDemoMusicprovider(MusicProvider):
         # This is only called if you reported the RECOMMENDATIONS feature in the supported_features.
         return []
 
-    async def sync_library(self, media_types: tuple[MediaType, ...]) -> None:
+    async def sync_library(self, media_type: MediaType) -> None:
         """Run library sync for this provider."""
-        # Run a full sync of the library for the given media types.
+        # Run a full sync of the library for the given media type.
         # This is called by the music controller to sync items from your provider to the library.
         # As a generic rule of thumb the default implementation within the MusicProvider
         # base model should be sufficient for most (streaming) providers.

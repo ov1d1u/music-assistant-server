@@ -18,14 +18,13 @@ from music_assistant_models.enums import (
 from music_assistant_models.errors import LoginFailed, MediaNotFoundError
 from music_assistant_models.media_items import (
     AudioFormat,
-    ItemMapping,
     MediaItemImage,
     MediaItemLink,
-    MediaItemType,
+    MediaItemTypeOrItemMapping,
     ProviderMapping,
     Radio,
 )
-from music_assistant_models.streamdetails import LivestreamMetadata, StreamDetails
+from music_assistant_models.streamdetails import StreamDetails
 from tenacity import RetryError
 
 from music_assistant.helpers.util import select_free_port
@@ -243,7 +242,7 @@ class SiriusXMProvider(MusicProvider):
 
         return self._current_stream_details
 
-    async def browse(self, path: str) -> Sequence[MediaItemType | ItemMapping]:
+    async def browse(self, path: str) -> Sequence[MediaItemTypeOrItemMapping]:
         """Browse this provider's items.
 
         :param path: The path to browse, (e.g. provider_id://artists).
@@ -269,10 +268,8 @@ class SiriusXMProvider(MusicProvider):
         if latest_cut_marker:
             latest_cut = latest_cut_marker.cut
             title = latest_cut.title
-            self._current_stream_details.stream_metadata = LivestreamMetadata(
-                title=title,
-                artist=", ".join([a.name for a in latest_cut.artists]),
-            )
+            artist = ", ".join([a.name for a in latest_cut.artists])
+            self._current_stream_details.stream_title = f"{artist} - {title}"
 
     async def _refresh_channels(self) -> bool:
         self._channels = await self._client.channels

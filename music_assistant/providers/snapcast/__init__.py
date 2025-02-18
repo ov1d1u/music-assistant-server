@@ -22,6 +22,7 @@ from music_assistant_models.enums import (
     PlayerState,
     PlayerType,
     ProviderFeature,
+    StreamType,
 )
 from music_assistant_models.errors import SetupFailedError
 from music_assistant_models.media_items import AudioFormat
@@ -42,6 +43,7 @@ from music_assistant.helpers.audio import FFMpeg, get_ffmpeg_stream, get_player_
 from music_assistant.helpers.process import AsyncProcess, check_output
 from music_assistant.helpers.util import get_ip_pton
 from music_assistant.models.player_provider import PlayerProvider
+from music_assistant.models.plugin import PluginProvider
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ProviderConfig
@@ -433,11 +435,16 @@ class SnapCastProvider(PlayerProvider):
         if stream_task := self._stream_tasks.pop(player_id, None):
             if not stream_task.done():
                 stream_task.cancel()
-        player.state = PlayerState.IDLE
-        self._set_childs_state(player_id)
-        self.mass.players.update(player_id)
+                with suppress(asyncio.CancelledError):
+                    await stream_task
         # assign default/empty stream to the player
         await self._get_snapgroup(player_id).set_stream("default")
+        await asyncio.sleep(0.5)
+        player.state = PlayerState.IDLE
+        player.current_media = None
+        player.active_source = None
+        self._set_childs_state(player_id)
+        self.mass.players.update(player_id)
 
     async def cmd_volume_mute(self, player_id: str, muted: bool) -> None:
         """Send MUTE command to given player."""
@@ -482,7 +489,7 @@ class SnapCastProvider(PlayerProvider):
         self.mass.players.update(player_id, skip_forward=True)
         self.mass.players.update(mass_player.synced_to, skip_forward=True)
 
-    async def play_media(self, player_id: str, media: PlayerMedia) -> None:
+    async def play_media(self, player_id: str, media: PlayerMedia) -> None:  # noqa: PLR0915
         """Handle PLAY MEDIA on given player."""
         player = self.mass.players.get(player_id)
         if player.synced_to:
@@ -506,16 +513,36 @@ class SnapCastProvider(PlayerProvider):
                 output_format=DEFAULT_SNAPCAST_FORMAT,
                 use_pre_announce=media.custom_data["use_pre_announce"],
             )
+        elif media.media_type == MediaType.PLUGIN_SOURCE:
+            # special case: plugin source stream
+            # consume the stream directly, so we can skip one step in between
+            assert media.custom_data is not None  # for type checking
+            provider = cast(PluginProvider, self.mass.get_provider(media.custom_data["provider"]))
+            plugin_source = provider.get_source()
+            assert plugin_source.audio_format is not None  # for type checking
+            input_format = plugin_source.audio_format
+            audio_source = (
+                provider.get_audio_stream(player_id)
+                if plugin_source.stream_type == StreamType.CUSTOM
+                else plugin_source.path
+            )
         elif media.queue_id.startswith("ugp_"):
             # special case: UGP stream
             ugp_provider: PlayerGroupProvider = self.mass.get_provider("player_group")
             ugp_stream = ugp_provider.ugp_streams[media.queue_id]
             input_format = ugp_stream.base_pcm_format
             audio_source = ugp_stream.subscribe_raw()
+        elif media.media_type == MediaType.RADIO:
+            # use single item stream request for radio streams
+            input_format = DEFAULT_SNAPCAST_FORMAT
+            audio_source = self.mass.streams.get_queue_item_stream(
+                queue_item=self.mass.player_queues.get_item(media.queue_id, media.queue_item_id),
+                pcm_format=DEFAULT_SNAPCAST_FORMAT,
+            )
         elif media.queue_id and media.queue_item_id:
             # regular queue (flow) stream request
             input_format = DEFAULT_SNAPCAST_PCM_FORMAT
-            audio_source = self.mass.streams.get_flow_stream(
+            audio_source = self.mass.streams.get_queue_flow_stream(
                 queue=self.mass.player_queues.get(media.queue_id),
                 start_queue_item=self.mass.player_queues.get_item(
                     media.queue_id, media.queue_item_id
@@ -545,6 +572,7 @@ class SnapCastProvider(PlayerProvider):
                         self.mass, player_id, input_format, DEFAULT_SNAPCAST_FORMAT
                     ),
                     audio_output=stream_path,
+                    extra_input_args=["-re"],
                 ) as ffmpeg_proc:
                     player.state = PlayerState.PLAYING
                     player.current_media = media

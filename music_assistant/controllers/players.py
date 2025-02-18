@@ -25,6 +25,7 @@ from music_assistant_models.enums import (
     PlayerFeature,
     PlayerState,
     PlayerType,
+    ProviderFeature,
     ProviderType,
 )
 from music_assistant_models.errors import (
@@ -57,6 +58,7 @@ from music_assistant.helpers.throttle_retry import Throttler
 from music_assistant.helpers.util import TaskManager, get_changed_values
 from music_assistant.models.core_controller import CoreController
 from music_assistant.models.player_provider import PlayerProvider
+from music_assistant.models.plugin import PluginProvider, PluginSource
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Coroutine, Iterator
@@ -715,6 +717,25 @@ class PlayerController(CoreController):
         - source: The ID of the source that needs to be activated/selected.
         """
         player = self.get(player_id, True)
+        if player.synced_to or player.active_group:
+            raise PlayerCommandFailed(f"Player {player.display_name} is currently grouped")
+        # check if player is already playing and source is different
+        # in that case we need to stop the player first
+        prev_source = player.active_source
+        if prev_source and source != prev_source and player.state != PlayerState.IDLE:
+            await self.cmd_stop(player_id)
+            await asyncio.sleep(0.5)  # small delay to allow stop to process
+            player.active_source = None
+        # check if source is a pluginsource
+        # in that case the source id is the lookup_key of the plugin provider
+        if plugin_prov := self.mass.get_provider(source):
+            await self._handle_select_plugin_source(player, plugin_prov)
+            return
+        # check if source is a mass queue
+        # this can be used to restore the queue after a source switch
+        if mass_queue := self.mass.player_queues.get(source):
+            player.active_source = mass_queue.queue_id
+            return
         # basic check if player supports source selection
         if PlayerFeature.SELECT_SOURCE not in player.supported_features:
             raise UnsupportedFeaturedException(
@@ -982,6 +1003,8 @@ class PlayerController(CoreController):
         player = self._players[player_id]
         prev_state = self._prev_states.get(player_id, {})
         player.active_source = self._get_active_source(player)
+        # set player sources
+        self._set_player_sources(player)
         # prefer any overridden name from config
         player.display_name = (
             self.mass.config.get_raw_player_config_value(player.player_id, "name")
@@ -1376,6 +1399,23 @@ class PlayerController(CoreController):
         # if player has group active, return those details
         if player.active_group and (group_player := self.get(player.active_group)):
             return self._get_active_source(group_player)
+        # if player has plugin source active return that
+        for plugin_source in self._get_plugin_sources():
+            if player.active_source == plugin_source.id or (
+                player.current_media and plugin_source.id == player.current_media.queue_id
+            ):
+                # copy/set current media if available
+                if plugin_source.metadata:
+                    player.set_current_media(
+                        uri=plugin_source.metadata.uri,
+                        media_type=plugin_source.metadata.media_type,
+                        title=plugin_source.metadata.title,
+                        artist=plugin_source.metadata.artist,
+                        album=plugin_source.metadata.album,
+                        image_url=plugin_source.metadata.image_url,
+                        duration=plugin_source.metadata.duration,
+                    )
+                return plugin_source.id
         # defaults to the player's own player id if no active source set
         return player.active_source or player.player_id
 
@@ -1584,3 +1624,49 @@ class PlayerController(CoreController):
                         # always update player state
                         self.mass.loop.call_soon(self.update, player_id)
             await asyncio.sleep(1)
+
+    async def _handle_select_plugin_source(
+        self, player: Player, plugin_prov: PluginProvider
+    ) -> None:
+        """Handle playback/select of given plugin source on player."""
+        plugin_source = plugin_prov.get_source()
+        if plugin_prov.in_use_by and plugin_prov.in_use_by != player.player_id:
+            raise PlayerCommandFailed(
+                f"Source {plugin_source.name} is already in use by another player"
+            )
+        player.active_source = plugin_source.id
+        stream_url = self.mass.streams.get_plugin_source_url(plugin_source.id, player.player_id)
+        await self.play_media(
+            player_id=player.player_id,
+            media=PlayerMedia(
+                uri=stream_url,
+                media_type=MediaType.PLUGIN_SOURCE,
+                title=plugin_source.name,
+                queue_id=plugin_source.id,
+                custom_data={
+                    "provider": plugin_source.id,
+                    "audio_format": plugin_source.audio_format,
+                },
+            ),
+        )
+
+    def _get_plugin_sources(self) -> list[PluginSource]:
+        """Return all available plugin sources."""
+        return [
+            plugin_prov.get_source()
+            for plugin_prov in self.mass.get_providers(ProviderType.PLUGIN)
+            if ProviderFeature.AUDIO_SOURCE in plugin_prov.supported_features
+        ]
+
+    def _set_player_sources(self, player: Player) -> None:
+        """Set all available player sources."""
+        player_source_ids = [x.id for x in player.source_list]
+        for plugin_prov in self.mass.get_providers(ProviderType.PLUGIN):
+            if ProviderFeature.AUDIO_SOURCE not in plugin_prov.supported_features:
+                continue
+            if plugin_prov.in_use_by and plugin_prov.in_use_by != player.player_id:
+                continue
+            plugin_source = plugin_prov.get_source()
+            if plugin_source.id in player_source_ids:
+                continue
+            player.source_list.append(plugin_source)

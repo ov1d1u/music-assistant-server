@@ -31,6 +31,7 @@ from music_assistant_models.media_items import (
     BrowseFolder,
     ItemMapping,
     MediaItemType,
+    MediaItemTypeOrItemMapping,
     SearchResults,
 )
 from music_assistant_models.provider import SyncTask
@@ -199,10 +200,13 @@ class MusicController(CoreController):
         if providers is None:
             providers = [x.instance_id for x in self.providers]
 
-        for provider in self.providers:
-            if provider.instance_id not in providers:
-                continue
-            self._start_provider_sync(provider, media_types)
+        for media_type in media_types:
+            for provider in self.providers:
+                if provider.instance_id not in providers:
+                    continue
+                if not provider.library_supported(media_type):
+                    continue
+                self._start_provider_sync(provider, media_type)
 
     @api_command("music/synctasks")
     def get_running_sync_tasks(self) -> list[SyncTask]:
@@ -471,7 +475,7 @@ class MusicController(CoreController):
         )
         db_rows = await self.mass.music.database.get_rows_from_query(query, limit=limit)
         result: list[ItemMapping] = []
-        available_providers = ("library", *get_global_cache_value("unique_providers", []))
+        available_providers = ("library", *get_global_cache_value("available_providers", []))
         for db_row in db_rows:
             result.append(
                 ItemMapping.from_dict(
@@ -541,12 +545,20 @@ class MusicController(CoreController):
         if media_type == MediaType.PODCAST_EPISODE:
             # special case for podcast episodes
             return await self.podcasts.episode(item_id, provider_instance_id_or_domain)
+        if media_type == MediaType.FOLDER:
+            # special case for folders
+            return BrowseFolder(
+                item_id=item_id,
+                provider=provider_instance_id_or_domain,
+                name=item_id,
+            )
         ctrl = self.get_controller(media_type)
         return await ctrl.get(
             item_id=item_id,
             provider_instance_id_or_domain=provider_instance_id_or_domain,
         )
 
+    @api_command("music/get_library_item")
     async def get_library_item_by_prov_id(
         self,
         media_type: MediaType,
@@ -563,7 +575,7 @@ class MusicController(CoreController):
     @api_command("music/favorites/add_item")
     async def add_item_to_favorites(
         self,
-        item: str | MediaItemType,
+        item: str | MediaItemTypeOrItemMapping,
     ) -> None:
         """Add an item to the favorites."""
         if isinstance(item, str):
@@ -794,7 +806,7 @@ class MusicController(CoreController):
     @api_command("music/mark_played")
     async def mark_item_played(
         self,
-        media_item: MediaItemType | ItemMapping,
+        media_item: MediaItemTypeOrItemMapping,
         fully_played: bool = True,
         seconds_played: int | None = None,
     ) -> None:
@@ -863,7 +875,7 @@ class MusicController(CoreController):
     @api_command("music/mark_unplayed")
     async def mark_item_unplayed(
         self,
-        media_item: MediaItemType | ItemMapping,
+        media_item: MediaItemTypeOrItemMapping,
     ) -> None:
         """Mark item as unplayed in playlog."""
         # update generic playlog table
@@ -976,29 +988,26 @@ class MusicController(CoreController):
                 domains.add(provider.domain)
         return instances
 
-    def _start_provider_sync(
-        self, provider: MusicProvider, media_types: tuple[MediaType, ...]
-    ) -> None:
+    def _start_provider_sync(self, provider: MusicProvider, media_type: MediaType) -> None:
         """Start sync task on provider and track progress."""
         # check if we're not already running a sync task for this provider/mediatype
         for sync_task in self.in_progress_syncs:
             if sync_task.provider_instance != provider.instance_id:
                 continue
-            for media_type in media_types:
-                if media_type in sync_task.media_types:
-                    self.logger.debug(
-                        "Skip sync task for %s because another task is already in progress",
-                        provider.name,
-                    )
-                    return
+            if media_type in sync_task.media_types:
+                self.logger.debug(
+                    "Skip sync task for %s because another task is already in progress",
+                    provider.name,
+                )
+                return
 
         async def run_sync() -> None:
             # Wrap the provider sync into a lock to prevent
             # race conditions when multiple providers are syncing at the same time.
             async with self._sync_lock:
-                await provider.sync_library(media_types)
+                await provider.sync_library(media_type)
             # precache playlist tracks
-            if MediaType.PLAYLIST in media_types:
+            if media_type == MediaType.PLAYLIST:
                 for playlist in await self.playlists.library_items(provider=provider.instance_id):
                     async for _ in self.playlists.tracks(playlist.item_id, playlist.provider):
                         pass
@@ -1008,7 +1017,7 @@ class MusicController(CoreController):
         sync_spec = SyncTask(
             provider_domain=provider.domain,
             provider_instance=provider.instance_id,
-            media_types=media_types,
+            media_types=(media_type,),
             task=task,
         )
         self.in_progress_syncs.append(sync_spec)

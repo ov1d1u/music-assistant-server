@@ -1,52 +1,53 @@
-"""Audiobookshelf provider for Music Assistant.
-
-Audiobookshelf is abbreviated ABS here.
-"""
+"""Audiobookshelf (abs) provider for Music Assistant."""
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncGenerator, Sequence
+from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import TYPE_CHECKING
 
+import aioaudiobookshelf as aioabs
+from aioaudiobookshelf.client.items import LibraryItemExpandedBook as AbsLibraryItemExpandedBook
+from aioaudiobookshelf.client.items import (
+    LibraryItemExpandedPodcast as AbsLibraryItemExpandedPodcast,
+)
+from aioaudiobookshelf.exceptions import LoginError as AbsLoginError
+from aioaudiobookshelf.schema.calls_authors import (
+    AuthorWithItemsAndSeries as AbsAuthorWithItemsAndSeries,
+)
+from aioaudiobookshelf.schema.calls_series import SeriesWithProgress as AbsSeriesWithProgress
+from aioaudiobookshelf.schema.library import (
+    LibraryItemExpanded,
+    LibraryItemExpandedBook,
+    LibraryItemExpandedPodcast,
+)
+from aioaudiobookshelf.schema.library import LibraryMediaType as AbsLibraryMediaType
+from mashumaro.mixins.dict import DataClassDictMixin
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueType, ProviderConfig
 from music_assistant_models.enums import (
     ConfigEntryType,
     ContentType,
-    ImageType,
     MediaType,
     ProviderFeature,
     StreamType,
 )
 from music_assistant_models.errors import LoginFailed, MediaNotFoundError
-from music_assistant_models.media_items import (
-    Audiobook,
-    AudioFormat,
-    BrowseFolder,
-    ItemMapping,
-    MediaItemChapter,
-    MediaItemImage,
-    MediaItemType,
-    Podcast,
-    PodcastEpisode,
-    ProviderMapping,
-    UniqueList,
-)
+from music_assistant_models.media_items import AudioFormat, BrowseFolder, MediaItemTypeOrItemMapping
 from music_assistant_models.streamdetails import StreamDetails
 
+from music_assistant.helpers.ffmpeg import get_ffmpeg_stream
 from music_assistant.models.music_provider import MusicProvider
-from music_assistant.providers.audiobookshelf.abs_client import ABSClient, LibraryWithItemIDs
-from music_assistant.providers.audiobookshelf.abs_schema import (
-    ABSDeviceInfo,
-    ABSLibraryItemExpandedBook,
-    ABSLibraryItemExpandedPodcast,
-    ABSLibraryItemMinifiedBook,
-    ABSLibraryItemMinifiedPodcast,
-    ABSPlaybackSessionExpanded,
-    ABSPodcastEpisodeExpanded,
+from music_assistant.providers.audiobookshelf.parsers import (
+    parse_audiobook,
+    parse_podcast,
+    parse_podcast_episode,
 )
 
 if TYPE_CHECKING:
+    from aioaudiobookshelf.schema.events_socket import LibraryItemRemoved
+    from aioaudiobookshelf.schema.media_progress import MediaProgress
+    from music_assistant_models.media_items import Audiobook, Podcast, PodcastEpisode
     from music_assistant_models.provider import ProviderManifest
 
     from music_assistant.mass import MusicAssistant
@@ -58,6 +59,70 @@ CONF_PASSWORD = "password"
 CONF_VERIFY_SSL = "verify_ssl"
 # optionally hide podcasts with no episodes
 CONF_HIDE_EMPTY_PODCASTS = "hide_empty_podcasts"
+
+# We do _not_ store the full library, just the helper classes LibrariesHelper/ LibraryHelper,
+# see below, i.e. only uuids and the lib's name.
+# Caching these can be removed, but I'd then have to iterate the full item list
+# within the browse function if the user wishes to see all audiobooks/ podcasts
+# of a library.
+CACHE_CATEGORY_LIBRARIES = 0
+CACHE_KEY_LIBRARIES = "libraries"
+
+
+class AbsBrowsePaths(StrEnum):
+    """Path prefixes for browse view."""
+
+    LIBRARIES_BOOK = "lb"
+    LIBRARIES_PODCAST = "lp"
+    AUTHORS = "a"
+    NARRATORS = "n"
+    SERIES = "s"
+    COLLECTIONS = "c"
+    AUDIOBOOKS = "b"
+
+
+class AbsBrowseItemsBook(StrEnum):
+    """Folder names in browse view for books."""
+
+    AUTHORS = "Authors"
+    NARRATORS = "Narrators"
+    SERIES = "Series"
+    COLLECTIONS = "Collections"
+    AUDIOBOOKS = "Audiobooks"
+
+
+class AbsBrowseItemsPodcast(StrEnum):
+    """Folder names in browse view for podcasts."""
+
+    PODCASTS = "Podcasts"
+
+
+@dataclass(kw_only=True)
+class LibraryHelper(DataClassDictMixin):
+    """Lib name + media items' uuids."""
+
+    name: str
+    item_ids: set[str] = field(default_factory=set)
+
+
+@dataclass(kw_only=True)
+class LibrariesHelper(DataClassDictMixin):
+    """Helper class to store ABSLibrary name, id and the uuids of its media items.
+
+    Dictionary is lib_id:AbsLibraryWithItemIDs.
+    """
+
+    audiobooks: dict[str, LibraryHelper] = field(default_factory=dict)
+    podcasts: dict[str, LibraryHelper] = field(default_factory=dict)
+
+
+ABSBROWSEITEMSTOPATH: dict[str, str] = {
+    AbsBrowseItemsBook.AUTHORS: AbsBrowsePaths.AUTHORS,
+    AbsBrowseItemsBook.NARRATORS: AbsBrowsePaths.NARRATORS,
+    AbsBrowseItemsBook.SERIES: AbsBrowsePaths.SERIES,
+    AbsBrowseItemsBook.COLLECTIONS: AbsBrowsePaths.COLLECTIONS,
+    AbsBrowseItemsBook.AUDIOBOOKS: AbsBrowsePaths.AUDIOBOOKS,
+}
 
 
 async def setup(
@@ -138,32 +203,46 @@ class Audiobookshelf(MusicProvider):
 
     async def handle_async_init(self) -> None:
         """Pass config values to client and initialize."""
-        self._client = ABSClient()
         base_url = str(self.config.get_value(CONF_URL))
         username = str(self.config.get_value(CONF_USERNAME))
-        try:
-            await self._client.init(
-                session=self.mass.http_session,
-                base_url=base_url,
-                username=username,
-                password=str(self.config.get_value(CONF_PASSWORD)),
-                logger=self.logger,
-                check_ssl=bool(self.config.get_value(CONF_VERIFY_SSL)),
-            )
-        except RuntimeError:
-            # login details were not correct
-            raise LoginFailed(f"Login to abs instance at {base_url} failed.")
-
-        # this will be provided when creating sessions or receive already opened sessions
-        self.device_info = ABSDeviceInfo(
-            device_id=self.instance_id,
-            client_name="Music Assistant",
-            client_version=self.mass.version,
-            manufacturer="",
-            model=self.mass.server_id,
+        password = str(self.config.get_value(CONF_PASSWORD))
+        verify_ssl = bool(self.config.get_value(CONF_VERIFY_SSL))
+        session_config = aioabs.SessionConfiguration(
+            session=self.mass.http_session,
+            url=base_url,
+            verify_ssl=verify_ssl,
+            logger=self.logger,
+            pagination_items_per_page=30,  # audible provider goes with 50 for pagination
         )
+        try:
+            self._client, self._client_socket = await aioabs.get_user_and_socket_client(
+                session_config=session_config, username=username, password=password
+            )
+            await self._client_socket.init_client()
+        except AbsLoginError as exc:
+            raise LoginFailed(f"Login to abs instance at {base_url} failed.") from exc
 
-        self.logger.debug(f"Our playback session device_id is {self.instance_id}")
+        self.cache_base_key = self.instance_id
+
+        cached_libraries = await self.mass.cache.get(
+            key=CACHE_KEY_LIBRARIES,
+            base_key=self.cache_base_key,
+            category=CACHE_CATEGORY_LIBRARIES,
+            default=None,
+        )
+        if cached_libraries is None:
+            self.libraries = LibrariesHelper()
+        else:
+            self.libraries = LibrariesHelper.from_dict(cached_libraries)
+
+        # set socket callbacks
+        self._client_socket.set_item_callbacks(
+            on_item_added=self._socket_abs_item_changed,
+            on_item_updated=self._socket_abs_item_changed,
+            on_item_removed=self._socket_abs_item_removed,
+            on_items_added=self._socket_abs_item_changed,
+            on_items_updated=self._socket_abs_item_changed,
+        )
 
     async def unload(self, is_removed: bool = False) -> None:
         """
@@ -172,8 +251,8 @@ class Audiobookshelf(MusicProvider):
         Called when provider is deregistered (e.g. MA exiting or config reloading).
         is_removed will be set to True when the provider is removed from the configuration.
         """
-        await self._client.close_all_playback_sessions()
         await self._client.logout()
+        await self._client_socket.logout()
 
     @property
     def is_streaming_provider(self) -> bool:
@@ -181,140 +260,110 @@ class Audiobookshelf(MusicProvider):
         # For streaming providers return True here but for local file based providers return False.
         return False
 
-    async def sync_library(self, media_types: tuple[MediaType, ...]) -> None:
-        """Run library sync for this provider."""
-        await self._client.sync()
-        await super().sync_library(media_types=media_types)
-
-    def _parse_podcast(
-        self, abs_podcast: ABSLibraryItemExpandedPodcast | ABSLibraryItemMinifiedPodcast
-    ) -> Podcast:
-        """Translate ABSPodcast to MassPodcast."""
-        title = abs_podcast.media.metadata.title
-        # Per API doc title may be None.
-        if title is None:
-            title = "UNKNOWN"
-        mass_podcast = Podcast(
-            item_id=abs_podcast.id_,
-            name=title,
-            publisher=abs_podcast.media.metadata.author,
-            provider=self.lookup_key,
-            provider_mappings={
-                ProviderMapping(
-                    item_id=abs_podcast.id_,
-                    provider_domain=self.domain,
-                    provider_instance=self.instance_id,
-                )
-            },
-        )
-        mass_podcast.metadata.description = abs_podcast.media.metadata.description
-        token = self._client.token
-        image_url = (
-            f"{self.config.get_value(CONF_URL)}/api/items/{abs_podcast.id_}/cover?token={token}"
-        )
-        mass_podcast.metadata.images = UniqueList(
-            [MediaItemImage(type=ImageType.THUMB, path=image_url, provider=self.lookup_key)]
-        )
-        mass_podcast.metadata.explicit = abs_podcast.media.metadata.explicit
-        if abs_podcast.media.metadata.language is not None:
-            mass_podcast.metadata.languages = UniqueList([abs_podcast.media.metadata.language])
-        if abs_podcast.media.metadata.genres is not None:
-            mass_podcast.metadata.genres = set(abs_podcast.media.metadata.genres)
-        mass_podcast.metadata.release_date = abs_podcast.media.metadata.release_date
-
-        if isinstance(abs_podcast, ABSLibraryItemExpandedPodcast):
-            mass_podcast.total_episodes = len(abs_podcast.media.episodes)
-        elif isinstance(abs_podcast, ABSLibraryItemMinifiedPodcast):
-            mass_podcast.total_episodes = abs_podcast.media.num_episodes
-
-        return mass_podcast
-
-    async def _parse_podcast_episode(
-        self,
-        episode: ABSPodcastEpisodeExpanded,
-        prov_podcast_id: str,
-        fallback_episode_cnt: int | None = None,
-    ) -> PodcastEpisode:
-        """Translate ABSPodcastEpisode to MassPodcastEpisode.
-
-        For an episode the id is set to f"{podcast_id} {episode_id}".
-        ABS ids have no spaces, so we can split at a space to retrieve both
-        in other functions.
-        """
-        url = f"{self.config.get_value(CONF_URL)}{episode.audio_track.content_url}"
-        episode_id = f"{prov_podcast_id} {episode.id_}"
-
-        if episode.published_at is not None:
-            position = -episode.published_at
-        else:
-            position = 0
-            if fallback_episode_cnt is not None:
-                position = fallback_episode_cnt
-        mass_episode = PodcastEpisode(
-            item_id=episode_id,
-            provider=self.lookup_key,
-            name=episode.title,
-            duration=int(episode.duration),
-            position=position,
-            podcast=ItemMapping(
-                item_id=prov_podcast_id,
-                provider=self.lookup_key,
-                name=episode.title,
-                media_type=MediaType.PODCAST,
-            ),
-            provider_mappings={
-                ProviderMapping(
-                    item_id=episode_id,
-                    provider_domain=self.domain,
-                    provider_instance=self.instance_id,
-                    audio_format=AudioFormat(
-                        content_type=ContentType.UNKNOWN,
-                    ),
-                    url=url,
-                )
-            },
-        )
-        progress, finished = await self._client.get_podcast_progress_ms(
-            prov_podcast_id, episode.id_
-        )
-        if progress is not None:
-            mass_episode.resume_position_ms = progress
-            mass_episode.fully_played = finished
-
-        # cover image
-        url_base = f"{self.config.get_value(CONF_URL)}"
-        url_api = f"/api/items/{prov_podcast_id}/cover?token={self._client.token}"
-        url_cover = f"{url_base}{url_api}"
-        mass_episode.metadata.images = UniqueList(
-            [MediaItemImage(type=ImageType.THUMB, path=url_cover, provider=self.lookup_key)]
-        )
-
-        return mass_episode
+    async def sync_library(self, media_type: MediaType) -> None:
+        """Obtain audiobook library ids and podcast library ids."""
+        libraries = await self._client.get_all_libraries()
+        for library in libraries:
+            if library.media_type == AbsLibraryMediaType.BOOK and media_type == MediaType.AUDIOBOOK:
+                self.libraries.audiobooks[library.id_] = LibraryHelper(name=library.name)
+            elif (
+                library.media_type == AbsLibraryMediaType.PODCAST
+                and media_type == MediaType.PODCAST
+            ):
+                self.libraries.podcasts[library.id_] = LibraryHelper(name=library.name)
+        await super().sync_library(media_type=media_type)
+        await self._cache_set_helper_libraries()
 
     async def get_library_podcasts(self) -> AsyncGenerator[Podcast, None]:
-        """Retrieve library/subscribed podcasts from the provider."""
-        async for abs_podcast in self._client.get_all_podcasts_minified():
-            mass_podcast = self._parse_podcast(abs_podcast)
-            if (
-                bool(self.config.get_value(CONF_HIDE_EMPTY_PODCASTS))
-                and mass_podcast.total_episodes == 0
-            ):
-                continue
-            yield mass_podcast
+        """Retrieve library/subscribed podcasts from the provider.
+
+        Minified podcast information is enough, but we take the full information
+        and rely on cache afterwards.
+        """
+        for pod_lib_id in self.libraries.podcasts:
+            async for response in self._client.get_library_items(library_id=pod_lib_id):
+                if not response.results:
+                    break
+                podcast_ids = [x.id_ for x in response.results]
+                # store uuids
+                self.libraries.podcasts[pod_lib_id].item_ids.update(podcast_ids)
+                podcasts_expanded = await self._client.get_library_item_batch_podcast(
+                    item_ids=podcast_ids
+                )
+                for podcast_expanded in podcasts_expanded:
+                    mass_podcast = parse_podcast(
+                        abs_podcast=podcast_expanded,
+                        lookup_key=self.lookup_key,
+                        domain=self.domain,
+                        instance_id=self.instance_id,
+                        token=self._client.token,
+                        base_url=str(self.config.get_value(CONF_URL)).rstrip("/"),
+                    )
+                    if (
+                        bool(self.config.get_value(CONF_HIDE_EMPTY_PODCASTS))
+                        and mass_podcast.total_episodes == 0
+                    ):
+                        continue
+                    yield mass_podcast
+
+    async def _get_abs_expanded_podcast(
+        self, prov_podcast_id: str
+    ) -> AbsLibraryItemExpandedPodcast:
+        abs_podcast = await self._client.get_library_item_podcast(
+            podcast_id=prov_podcast_id, expanded=True
+        )
+        assert isinstance(abs_podcast, AbsLibraryItemExpandedPodcast)
+
+        return abs_podcast
 
     async def get_podcast(self, prov_podcast_id: str) -> Podcast:
-        """Get single podcast."""
-        abs_podcast = await self._client.get_podcast_expanded(prov_podcast_id)
-        return self._parse_podcast(abs_podcast)
+        """Get single podcast.
+
+        Basis information,
+        abs_podcast = await self._client.get_library_item_podcast(
+            podcast_id=prov_podcast_id, expanded=False
+        ),
+        would be sufficient, but we rely on cache.
+        """
+        abs_podcast = await self._get_abs_expanded_podcast(prov_podcast_id=prov_podcast_id)
+        return parse_podcast(
+            abs_podcast=abs_podcast,
+            lookup_key=self.lookup_key,
+            domain=self.domain,
+            instance_id=self.instance_id,
+            token=self._client.token,
+            base_url=str(self.config.get_value(CONF_URL)).rstrip("/"),
+        )
 
     async def get_podcast_episodes(self, prov_podcast_id: str) -> list[PodcastEpisode]:
-        """Get all podcast episodes of podcast."""
-        abs_podcast = await self._client.get_podcast_expanded(prov_podcast_id)
+        """Get all podcast episodes of podcast.
+
+        Adds progress information.
+        """
+        abs_podcast = await self._get_abs_expanded_podcast(prov_podcast_id=prov_podcast_id)
         episode_list = []
         episode_cnt = 1
+        # the user has the progress of all media items
+        # so we use a single api call here to obtain possibly many
+        # progresses for episodes
+        user = await self._client.get_my_user()
+        abs_progresses = {
+            x.episode_id: x
+            for x in user.media_progress
+            if x.episode_id is not None and x.library_item_id == prov_podcast_id
+        }
         for abs_episode in abs_podcast.media.episodes:
-            mass_episode = await self._parse_podcast_episode(
-                abs_episode, prov_podcast_id, episode_cnt
+            progress = abs_progresses.get(abs_episode.id_, None)
+            mass_episode = parse_podcast_episode(
+                episode=abs_episode,
+                prov_podcast_id=prov_podcast_id,
+                fallback_episode_cnt=episode_cnt,
+                lookup_key=self.lookup_key,
+                domain=self.domain,
+                instance_id=self.instance_id,
+                token=self._client.token,
+                base_url=str(self.config.get_value(CONF_URL)).rstrip("/"),
+                media_progress=progress,
             )
             episode_list.append(mass_episode)
             episode_cnt += 1
@@ -323,171 +372,144 @@ class Audiobookshelf(MusicProvider):
     async def get_podcast_episode(self, prov_episode_id: str) -> PodcastEpisode:
         """Get single podcast episode."""
         prov_podcast_id, e_id = prov_episode_id.split(" ")
-        abs_podcast = await self._client.get_podcast_expanded(prov_podcast_id)
+        abs_podcast = await self._get_abs_expanded_podcast(prov_podcast_id=prov_podcast_id)
         episode_cnt = 1
         for abs_episode in abs_podcast.media.episodes:
             if abs_episode.id_ == e_id:
-                return await self._parse_podcast_episode(abs_episode, prov_podcast_id, episode_cnt)
+                progress = await self._client.get_my_media_progress(
+                    item_id=prov_podcast_id, episode_id=abs_episode.id_
+                )
+                return parse_podcast_episode(
+                    episode=abs_episode,
+                    prov_podcast_id=prov_podcast_id,
+                    fallback_episode_cnt=episode_cnt,
+                    lookup_key=self.lookup_key,
+                    domain=self.domain,
+                    instance_id=self.instance_id,
+                    token=self._client.token,
+                    base_url=str(self.config.get_value(CONF_URL)).rstrip("/"),
+                    media_progress=progress,
+                )
 
             episode_cnt += 1
         raise MediaNotFoundError("Episode not found")
 
-    async def _parse_audiobook(
-        self, abs_audiobook: ABSLibraryItemExpandedBook | ABSLibraryItemMinifiedBook
-    ) -> Audiobook:
-        mass_audiobook = Audiobook(
-            item_id=abs_audiobook.id_,
-            provider=self.lookup_key,
-            name=abs_audiobook.media.metadata.title,
-            duration=int(abs_audiobook.media.duration),
-            provider_mappings={
-                ProviderMapping(
-                    item_id=abs_audiobook.id_,
-                    provider_domain=self.domain,
-                    provider_instance=self.instance_id,
-                )
-            },
-            publisher=abs_audiobook.media.metadata.publisher,
-        )
-        mass_audiobook.metadata.description = abs_audiobook.media.metadata.description
-        if abs_audiobook.media.metadata.language is not None:
-            mass_audiobook.metadata.languages = UniqueList([abs_audiobook.media.metadata.language])
-        mass_audiobook.metadata.release_date = abs_audiobook.media.metadata.published_date
-        if abs_audiobook.media.metadata.genres is not None:
-            mass_audiobook.metadata.genres = set(abs_audiobook.media.metadata.genres)
-
-        mass_audiobook.metadata.explicit = abs_audiobook.media.metadata.explicit
-
-        # cover
-        base_url = f"{self.config.get_value(CONF_URL)}"
-        api_url = f"/api/items/{abs_audiobook.id_}/cover?token={self._client.token}"
-        cover_url = f"{base_url}{api_url}"
-        mass_audiobook.metadata.images = UniqueList(
-            [MediaItemImage(type=ImageType.THUMB, path=cover_url, provider=self.lookup_key)]
-        )
-
-        # expanded version
-        if isinstance(abs_audiobook, ABSLibraryItemExpandedBook):
-            authors = UniqueList([x.name for x in abs_audiobook.media.metadata.authors])
-            narrators = UniqueList(abs_audiobook.media.metadata.narrators)
-            mass_audiobook.authors = authors
-            mass_audiobook.narrators = narrators
-            chapters = []
-            for idx, chapter in enumerate(abs_audiobook.media.chapters):
-                chapters.append(
-                    MediaItemChapter(
-                        position=idx + 1,  # chapter starting at 1
-                        name=chapter.title,
-                        start=chapter.start,
-                        end=chapter.end,
-                    )
-                )
-            mass_audiobook.metadata.chapters = chapters
-
-            progress, finished = await self._client.get_audiobook_progress_ms(abs_audiobook.id_)
-            if progress is not None:
-                mass_audiobook.resume_position_ms = progress
-                mass_audiobook.fully_played = finished
-        elif isinstance(abs_audiobook, ABSLibraryItemMinifiedBook):
-            mass_audiobook.authors = UniqueList([abs_audiobook.media.metadata.author_name])
-            mass_audiobook.narrators = UniqueList([abs_audiobook.media.metadata.narrator_name])
-
-        return mass_audiobook
-
     async def get_library_audiobooks(self) -> AsyncGenerator[Audiobook, None]:
         """Get Audiobook libraries.
 
-        We need the expanded version here to have chapters shown!
+        Need expanded version for chapters.
         """
-        async for abs_audiobook in self._client.get_all_audiobooks_minified():
-            abs_audiobook_expanded = await self._client.get_audiobook_expanded(abs_audiobook.id_)
-            mass_audiobook = await self._parse_audiobook(abs_audiobook_expanded)
-            yield mass_audiobook
+        for book_lib_id in self.libraries.audiobooks:
+            async for response in self._client.get_library_items(library_id=book_lib_id):
+                if not response.results:
+                    break
+                book_ids = [x.id_ for x in response.results]
+                # store uuids
+                self.libraries.audiobooks[book_lib_id].item_ids.update(book_ids)
+                # use expanded version for chapters/ caching.
+                books_expanded = await self._client.get_library_item_batch_book(item_ids=book_ids)
+                for book_expanded in books_expanded:
+                    mass_audiobook = parse_audiobook(
+                        abs_audiobook=book_expanded,
+                        lookup_key=self.lookup_key,
+                        domain=self.domain,
+                        instance_id=self.instance_id,
+                        token=self._client.token,
+                        base_url=str(self.config.get_value(CONF_URL)).rstrip("/"),
+                    )
+                    yield mass_audiobook
+
+    async def _get_abs_expanded_audiobook(
+        self, prov_audiobook_id: str
+    ) -> AbsLibraryItemExpandedBook:
+        abs_audiobook = await self._client.get_library_item_book(
+            book_id=prov_audiobook_id, expanded=True
+        )
+        assert isinstance(abs_audiobook, AbsLibraryItemExpandedBook)
+
+        return abs_audiobook
 
     async def get_audiobook(self, prov_audiobook_id: str) -> Audiobook:
-        """Get a single audiobook."""
-        abs_audiobook = await self._client.get_audiobook_expanded(prov_audiobook_id)
-        return await self._parse_audiobook(abs_audiobook)
+        """Get a single audiobook.
 
-    async def get_streamdetails_from_playback_session(
-        self, session: ABSPlaybackSessionExpanded
-    ) -> StreamDetails:
-        """Give Streamdetails from given session."""
-        tracks = session.audio_tracks
-        if len(tracks) == 0:
-            raise RuntimeError("Playback session has no tracks to play")
-        track = tracks[0]
-        track_url = track.content_url
-        if track_url.split("/")[1] != "hls":
-            raise RuntimeError("Did expect HLS stream for session playback")
-        item_id = ""
-        if session.media_type == "podcast":
-            media_type = MediaType.PODCAST_EPISODE
-            podcast_id = session.library_item_id
-            session_id = session.id_
-            episode_id = session.episode_id
-            item_id = f"{podcast_id} {episode_id} {session_id}"
-        else:
-            media_type = MediaType.AUDIOBOOK
-            audiobook_id = session.library_item_id
-            session_id = session.id_
-            item_id = f"{audiobook_id} {session_id}"
-        token = self._client.token
-        base_url = str(self.config.get_value(CONF_URL))
-        media_url = track.content_url
-        stream_url = f"{base_url}{media_url}?token={token}"
-        return StreamDetails(
-            provider=self.instance_id,
-            item_id=item_id,
-            audio_format=AudioFormat(
-                content_type=ContentType.UNKNOWN,
-            ),
-            media_type=media_type,
-            stream_type=StreamType.HLS,
-            path=stream_url,
-            can_seek=True,
-            allow_seek=True,
+        Progress is added here.
+        """
+        progress = await self._client.get_my_media_progress(item_id=prov_audiobook_id)
+        abs_audiobook = await self._get_abs_expanded_audiobook(prov_audiobook_id=prov_audiobook_id)
+        return parse_audiobook(
+            abs_audiobook=abs_audiobook,
+            lookup_key=self.lookup_key,
+            domain=self.domain,
+            instance_id=self.instance_id,
+            token=self._client.token,
+            base_url=str(self.config.get_value(CONF_URL)).rstrip("/"),
+            media_progress=progress,
         )
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Get stream of item."""
-        # self.logger.debug(f"Streamdetails: {item_id}")
         if media_type == MediaType.PODCAST_EPISODE:
-            return await self._get_stream_details_podcast_episode(item_id)
+            return await self._get_stream_details_episode(item_id)
         elif media_type == MediaType.AUDIOBOOK:
-            abs_audiobook = await self._client.get_audiobook_expanded(item_id)
-            tracks = abs_audiobook.media.tracks
-            if len(tracks) == 0:
-                raise MediaNotFoundError("Stream not found")
-            if len(tracks) > 1:
-                session = await self._client.get_playback_session_audiobook(
-                    device_info=self.device_info, audiobook_id=item_id
-                )
-                # small delay, allow abs to launch ffmpeg process
-                await asyncio.sleep(1)
-                return await self.get_streamdetails_from_playback_session(session)
+            abs_audiobook = await self._get_abs_expanded_audiobook(prov_audiobook_id=item_id)
             return await self._get_stream_details_audiobook(abs_audiobook)
         raise MediaNotFoundError("Stream unknown")
 
     async def _get_stream_details_audiobook(
-        self, abs_audiobook: ABSLibraryItemExpandedBook
+        self, abs_audiobook: AbsLibraryItemExpandedBook
     ) -> StreamDetails:
-        """Only single audio file in audiobook."""
-        self.logger.debug(
-            f"Using direct playback for audiobook {abs_audiobook.media.metadata.title}"
-        )
+        """Streamdetails audiobook."""
         tracks = abs_audiobook.media.tracks
         token = self._client.token
         base_url = str(self.config.get_value(CONF_URL))
-        media_url = tracks[0].content_url
+        if len(tracks) == 0:
+            raise MediaNotFoundError("Stream not found")
+        if len(tracks) > 1:
+            self.logger.debug("Using playback for multiple file audiobook.")
+            multiple_files = []
+            for track in tracks:
+                media_url = track.content_url
+                stream_url = f"{base_url}{media_url}?token={token}"
+                content_type = ContentType.UNKNOWN
+                if track.metadata is not None:
+                    content_type = ContentType.try_parse(track.metadata.ext)
+                multiple_files.append(
+                    (AudioFormat(content_type=content_type), stream_url, track.duration)
+                )
+
+            return StreamDetails(
+                provider=self.instance_id,
+                item_id=abs_audiobook.id_,
+                # for the concatanated stream, we need to use a pcm stream format
+                audio_format=AudioFormat(
+                    content_type=ContentType.PCM_S16LE,
+                    sample_rate=44100,
+                    bit_depth=16,
+                    channels=2,
+                ),
+                media_type=MediaType.AUDIOBOOK,
+                stream_type=StreamType.CUSTOM,
+                duration=int(abs_audiobook.media.duration),
+                data=multiple_files,
+                allow_seek=True,
+                can_seek=True,
+            )
+
+        self.logger.debug(
+            f'Using direct playback for audiobook "{abs_audiobook.media.metadata.title}".'
+        )
+
+        track = abs_audiobook.media.tracks[0]
+        media_url = track.content_url
         stream_url = f"{base_url}{media_url}?token={token}"
-        # audiobookshelf returns information of stream, so we should be able
-        # to lift unknown at some point.
+        content_type = ContentType.UNKNOWN
+        if track.metadata is not None:
+            content_type = ContentType.try_parse(track.metadata.ext)
         return StreamDetails(
             provider=self.lookup_key,
             item_id=abs_audiobook.id_,
             audio_format=AudioFormat(
-                content_type=ContentType.UNKNOWN,
+                content_type=content_type,
             ),
             media_type=MediaType.AUDIOBOOK,
             stream_type=StreamType.HTTP,
@@ -496,27 +518,30 @@ class Audiobookshelf(MusicProvider):
             allow_seek=True,
         )
 
-    async def _get_stream_details_podcast_episode(self, podcast_id: str) -> StreamDetails:
-        """Stream of a Podcast."""
+    async def _get_stream_details_episode(self, podcast_id: str) -> StreamDetails:
+        """Streamdetails of a podcast episode."""
         abs_podcast_id, abs_episode_id = podcast_id.split(" ")
         abs_episode = None
 
-        abs_podcast = await self._client.get_podcast_expanded(abs_podcast_id)
+        abs_podcast = await self._get_abs_expanded_podcast(prov_podcast_id=abs_podcast_id)
         for abs_episode in abs_podcast.media.episodes:
             if abs_episode.id_ == abs_episode_id:
                 break
         if abs_episode is None:
             raise MediaNotFoundError("Stream not found")
-        self.logger.debug(f"Using direct playback for podcast episode {abs_episode.title}")
+        self.logger.debug(f'Using direct playback for podcast episode "{abs_episode.title}".')
         token = self._client.token
         base_url = str(self.config.get_value(CONF_URL))
         media_url = abs_episode.audio_track.content_url
         full_url = f"{base_url}{media_url}?token={token}"
+        content_type = ContentType.UNKNOWN
+        if abs_episode.audio_track.metadata is not None:
+            content_type = ContentType.try_parse(abs_episode.audio_track.metadata.ext)
         return StreamDetails(
             provider=self.lookup_key,
             item_id=podcast_id,
             audio_format=AudioFormat(
-                content_type=ContentType.UNKNOWN,
+                content_type=content_type,
             ),
             media_type=MediaType.PODCAST_EPISODE,
             stream_type=StreamType.HTTP,
@@ -524,6 +549,52 @@ class Audiobookshelf(MusicProvider):
             can_seek=True,
             allow_seek=True,
         )
+
+    async def get_audio_stream(
+        self, streamdetails: StreamDetails, seek_position: int = 0
+    ) -> AsyncGenerator[bytes, None]:
+        """
+        Return the (custom) audio stream for the provider item.
+
+        Only used for multi-file audiobooks.
+        """
+        stream_data: list[tuple[AudioFormat, str, float]] = streamdetails.data
+        total_duration = 0.0
+        for audio_format, chapter_file, chapter_duration in stream_data:
+            total_duration += chapter_duration
+            if total_duration < seek_position:
+                continue
+            seek_position_netto = round(
+                max(0, seek_position - (total_duration - chapter_duration)), 2
+            )
+            self.logger.debug(chapter_file)
+            async for chunk in get_ffmpeg_stream(
+                chapter_file,
+                input_format=audio_format,
+                # output format is always pcm because we are sending
+                # the result of multiple files as one big stream
+                output_format=streamdetails.audio_format,
+                extra_input_args=["-ss", str(seek_position_netto)] if seek_position_netto else [],
+            ):
+                yield chunk
+
+    async def get_resume_position(self, item_id: str, media_type: MediaType) -> tuple[bool, int]:
+        """Return finished:bool, position_ms: int."""
+        progress: None | MediaProgress = None
+        if media_type == MediaType.PODCAST_EPISODE:
+            abs_podcast_id, abs_episode_id = item_id.split(" ")
+            progress = await self._client.get_my_media_progress(
+                item_id=abs_podcast_id, episode_id=abs_episode_id
+            )
+
+        if media_type == MediaType.AUDIOBOOK:
+            progress = await self._client.get_my_media_progress(item_id=item_id)
+
+        if progress is not None:
+            self.logger.debug("Resume position: obtained.")
+            return progress.is_finished, int(progress.current_time * 1000)
+
+        return False, 0
 
     async def on_played(
         self, media_type: MediaType, item_id: str, fully_played: bool, position: int
@@ -537,104 +608,413 @@ class Audiobookshelf(MusicProvider):
         We ignore PODCAST (function is called on adding a podcast with position=None)
 
         """
-        # self.logger.debug(f"on_played: {media_type=} {item_id=}, {fully_played=} {position=}")
         if media_type == MediaType.PODCAST_EPISODE:
             abs_podcast_id, abs_episode_id = item_id.split(" ")
             mass_podcast_episode = await self.get_podcast_episode(item_id)
             duration = mass_podcast_episode.duration
-            self.logger.debug(f"Updating of {media_type.value} named {mass_podcast_episode.name}")
-            await self._client.update_podcast_progress(
-                podcast_id=abs_podcast_id,
+            self.logger.debug(
+                f"Updating media progress of {media_type.value}, title {mass_podcast_episode.name}."
+            )
+            await self._client.update_my_media_progress(
+                item_id=abs_podcast_id,
                 episode_id=abs_episode_id,
-                progress_s=position,
-                duration_s=duration,
+                duration_seconds=duration,
+                progress_seconds=position,
                 is_finished=fully_played,
             )
         if media_type == MediaType.AUDIOBOOK:
             mass_audiobook = await self.get_audiobook(item_id)
             duration = mass_audiobook.duration
             self.logger.debug(f"Updating {media_type.value} named {mass_audiobook.name} progress")
-            await self._client.update_audiobook_progress(
-                audiobook_id=item_id,
-                progress_s=position,
-                duration_s=duration,
+            await self._client.update_my_media_progress(
+                item_id=item_id,
+                duration_seconds=duration,
+                progress_seconds=position,
                 is_finished=fully_played,
             )
 
-    async def _browse_root(
-        self, library_list: list[LibraryWithItemIDs], item_path: str
-    ) -> Sequence[MediaItemType | ItemMapping]:
-        """Browse root folder in browse view.
+    async def browse(self, path: str) -> Sequence[MediaItemTypeOrItemMapping]:
+        """Browse for audiobookshelf.
 
-        Helper functions. Shows the library name, ABS supports multiple libraries
-        of both podcasts and audiobooks.
+        Generates this view:
+        Library_Name_A (Audiobooks)
+            Audiobooks
+                Audiobook_1
+                Audiobook_2
+            Series
+                Series_1
+                    Audiobook_1
+                    Audiobook_2
+                Series_2
+                    Audiobook_3
+                    Audiobook_4
+            Collections
+                Collection_1
+                    Audiobook_1
+                    Audiobook_2
+                Collection_2
+                    Audiobook_3
+                    Audiobook_4
+            Authors
+                Author_1
+                    Series_1
+                    Audiobook_1
+                    Audiobook_2
+                Author_2
+                    Audiobook_3
+        Library_Name_B (Podcasts)
+            Podcast_1
+            Podcast_2
         """
-        items: list[MediaItemType | ItemMapping] = []
-        for library in library_list:
+        item_path = path.split("://", 1)[1]
+        if not item_path:
+            return self._browse_root()
+        sub_path = item_path.split("/")
+        lib_key, lib_id = sub_path[0].split(" ")
+        if len(sub_path) == 1:
+            if lib_key == AbsBrowsePaths.LIBRARIES_PODCAST:
+                return await self._browse_lib_podcasts(library_id=lib_id)
+            else:
+                return self._browse_lib_audiobooks(current_path=path)
+        elif len(sub_path) == 2:
+            item_key = sub_path[1]
+            match item_key:
+                case AbsBrowsePaths.AUTHORS:
+                    return await self._browse_authors(current_path=path, library_id=lib_id)
+                case AbsBrowsePaths.NARRATORS:
+                    return await self._browse_narrators(current_path=path, library_id=lib_id)
+                case AbsBrowsePaths.SERIES:
+                    return await self._browse_series(current_path=path, library_id=lib_id)
+                case AbsBrowsePaths.COLLECTIONS:
+                    return await self._browse_collections(current_path=path, library_id=lib_id)
+                case AbsBrowsePaths.AUDIOBOOKS:
+                    return await self._browse_books(library_id=lib_id)
+        elif len(sub_path) == 3:
+            item_key, item_id = sub_path[1:3]
+            match item_key:
+                case AbsBrowsePaths.AUTHORS:
+                    return await self._browse_author_books(current_path=path, author_id=item_id)
+                case AbsBrowsePaths.NARRATORS:
+                    return await self._browse_narrator_books(
+                        library_id=lib_id, narrator_filter_str=item_id
+                    )
+                case AbsBrowsePaths.SERIES:
+                    return await self._browse_series_books(series_id=item_id)
+                case AbsBrowsePaths.COLLECTIONS:
+                    return await self._browse_collection_books(collection_id=item_id)
+        elif len(sub_path) == 4:
+            # series within author
+            series_id = sub_path[3]
+            return await self._browse_series_books(series_id=series_id)
+        return []
+
+    def _browse_root(self) -> Sequence[MediaItemTypeOrItemMapping]:
+        items = []
+
+        def _get_folder(path: str, lib_id: str, lib_name: str) -> BrowseFolder:
+            return BrowseFolder(
+                item_id=lib_id,
+                name=lib_name,
+                provider=self.lookup_key,
+                path=f"{self.instance_id}://{path}",
+            )
+
+        for lib_id, lib in self.libraries.audiobooks.items():
+            path = f"{AbsBrowsePaths.LIBRARIES_BOOK} {lib_id}"
+            name = f"{lib.name} ({AbsBrowseItemsBook.AUDIOBOOKS})"
+            items.append(_get_folder(path, lib_id, name))
+        for lib_id, lib in self.libraries.podcasts.items():
+            path = f"{AbsBrowsePaths.LIBRARIES_PODCAST} {lib_id}"
+            name = f"{lib.name} ({AbsBrowseItemsPodcast.PODCASTS})"
+            items.append(_get_folder(path, lib_id, name))
+        return items
+
+    async def _browse_lib_podcasts(self, library_id: str) -> list[MediaItemTypeOrItemMapping]:
+        """No sub categories for podcasts."""
+        items = []
+        for podcast_id in self.libraries.podcasts[library_id].item_ids:
+            mass_item = await self.mass.music.get_library_item_by_prov_id(
+                media_type=MediaType.PODCAST,
+                item_id=podcast_id,
+                provider_instance_id_or_domain=self.instance_id,
+            )
+            if mass_item is not None:
+                items.append(mass_item)
+        return sorted(items, key=lambda x: x.name)
+
+    def _browse_lib_audiobooks(self, current_path: str) -> Sequence[MediaItemTypeOrItemMapping]:
+        items = []
+        for item_name in AbsBrowseItemsBook:
+            path = current_path + "/" + ABSBROWSEITEMSTOPATH[item_name]
             items.append(
                 BrowseFolder(
-                    item_id=library.id_,
-                    name=library.name,
+                    item_id=item_name.lower(),
+                    name=item_name,
                     provider=self.lookup_key,
-                    path=f"{self.instance_id}://{item_path}/{library.id_}",
+                    path=path,
                 )
             )
         return items
 
-    async def _browse_lib(
-        self,
-        library_id: str,
-        library_list: list[LibraryWithItemIDs],
-        media_type: MediaType,
-    ) -> Sequence[MediaItemType | ItemMapping]:
-        """Browse lib folder in browse view.
+    async def _browse_authors(
+        self, current_path: str, library_id: str
+    ) -> Sequence[MediaItemTypeOrItemMapping]:
+        abs_authors = await self._client.get_library_authors(library_id=library_id)
+        items = []
+        for author in abs_authors:
+            path = f"{current_path}/{author.id_}"
+            items.append(
+                BrowseFolder(
+                    item_id=author.id_,
+                    name=author.name,
+                    provider=self.lookup_key,
+                    path=path,
+                )
+            )
 
-        Helper functions. Shows the items which are part of an ABS library.
-        """
-        library = None
-        for library in library_list:
-            if library_id == library.id_:
+        return sorted(items, key=lambda x: x.name)
+
+    async def _browse_narrators(
+        self, current_path: str, library_id: str
+    ) -> Sequence[MediaItemTypeOrItemMapping]:
+        abs_narrators = await self._client.get_library_narrators(library_id=library_id)
+        items = []
+        for narrator in abs_narrators:
+            path = f"{current_path}/{narrator.id_}"
+            items.append(
+                BrowseFolder(
+                    item_id=narrator.id_,
+                    name=narrator.name,
+                    provider=self.lookup_key,
+                    path=path,
+                )
+            )
+
+        return sorted(items, key=lambda x: x.name)
+
+    async def _browse_series(
+        self, current_path: str, library_id: str
+    ) -> Sequence[MediaItemTypeOrItemMapping]:
+        items = []
+        async for response in self._client.get_library_series(library_id=library_id):
+            if not response.results:
                 break
-        if library is None:
-            raise MediaNotFoundError("Lib missing.")
+            for abs_series in response.results:
+                path = f"{current_path}/{abs_series.id_}"
+                items.append(
+                    BrowseFolder(
+                        item_id=abs_series.id_,
+                        name=abs_series.name,
+                        provider=self.lookup_key,
+                        path=path,
+                    )
+                )
 
-        items: list[MediaItemType | ItemMapping] = []
-        if media_type in [MediaType.PODCAST, MediaType.AUDIOBOOK]:
-            for item_id in library.item_ids:
+        return sorted(items, key=lambda x: x.name)
+
+    async def _browse_collections(
+        self, current_path: str, library_id: str
+    ) -> Sequence[MediaItemTypeOrItemMapping]:
+        items = []
+        async for response in self._client.get_library_collections(library_id=library_id):
+            if not response.results:
+                break
+            for abs_collection in response.results:
+                path = f"{current_path}/{abs_collection.id_}"
+                items.append(
+                    BrowseFolder(
+                        item_id=abs_collection.id_,
+                        name=abs_collection.name,
+                        provider=self.lookup_key,
+                        path=path,
+                    )
+                )
+        return sorted(items, key=lambda x: x.name)
+
+    async def _browse_books(self, library_id: str) -> Sequence[MediaItemTypeOrItemMapping]:
+        items = []
+        for book_id in self.libraries.audiobooks[library_id].item_ids:
+            mass_item = await self.mass.music.get_library_item_by_prov_id(
+                media_type=MediaType.AUDIOBOOK,
+                item_id=book_id,
+                provider_instance_id_or_domain=self.instance_id,
+            )
+            if mass_item is not None:
+                items.append(mass_item)
+        return sorted(items, key=lambda x: x.name)
+
+    async def _browse_author_books(
+        self, current_path: str, author_id: str
+    ) -> Sequence[MediaItemTypeOrItemMapping]:
+        items: list[MediaItemTypeOrItemMapping] = []
+
+        abs_author = await self._client.get_author(
+            author_id=author_id, include_items=True, include_series=True
+        )
+        if not isinstance(abs_author, AbsAuthorWithItemsAndSeries):
+            raise TypeError("Unexpected type of author.")
+
+        book_ids = {x.id_ for x in abs_author.library_items}
+        series_book_ids = set()
+
+        for series in abs_author.series:
+            series_book_ids.update([x.id_ for x in series.items])
+            path = f"{current_path}/{series.id_}"
+            items.append(
+                BrowseFolder(
+                    item_id=series.id_,
+                    name=f"{series.name} ({AbsBrowseItemsBook.SERIES})",
+                    provider=self.lookup_key,
+                    path=path,
+                )
+            )
+        book_ids = book_ids.difference(series_book_ids)
+        for book_id in book_ids:
+            mass_item = await self.mass.music.get_library_item_by_prov_id(
+                media_type=MediaType.AUDIOBOOK,
+                item_id=book_id,
+                provider_instance_id_or_domain=self.instance_id,
+            )
+            if mass_item is not None:
+                items.append(mass_item)
+
+        return items
+
+    async def _browse_narrator_books(
+        self, library_id: str, narrator_filter_str: str
+    ) -> Sequence[MediaItemTypeOrItemMapping]:
+        items: list[MediaItemTypeOrItemMapping] = []
+        async for response in self._client.get_library_items(
+            library_id=library_id, filter_str=f"narrators.{narrator_filter_str}"
+        ):
+            if not response.results:
+                break
+            for item in response.results:
                 mass_item = await self.mass.music.get_library_item_by_prov_id(
-                    media_type=media_type,
-                    item_id=item_id,
+                    media_type=MediaType.AUDIOBOOK,
+                    item_id=item.id_,
                     provider_instance_id_or_domain=self.instance_id,
                 )
                 if mass_item is not None:
                     items.append(mass_item)
-        else:
-            raise RuntimeError(f"Media type must not be {media_type}")
+
+        return sorted(items, key=lambda x: x.name)
+
+    async def _browse_series_books(self, series_id: str) -> Sequence[MediaItemTypeOrItemMapping]:
+        items = []
+
+        abs_series = await self._client.get_series(series_id=series_id, include_progress=True)
+        if not isinstance(abs_series, AbsSeriesWithProgress):
+            raise TypeError("Unexpected series type.")
+
+        for book_id in abs_series.progress.library_item_ids:
+            # these are sorted in abs by sequence
+            mass_item = await self.mass.music.get_library_item_by_prov_id(
+                media_type=MediaType.AUDIOBOOK,
+                item_id=book_id,
+                provider_instance_id_or_domain=self.instance_id,
+            )
+            if mass_item is not None:
+                items.append(mass_item)
+
         return items
 
-    async def browse(self, path: str) -> Sequence[MediaItemType | ItemMapping]:
-        """Browse features shows libraries names."""
-        item_path = path.split("://", 1)[1]
-        if not item_path:  # root
-            return await super().browse(path)
+    async def _browse_collection_books(
+        self, collection_id: str
+    ) -> Sequence[MediaItemTypeOrItemMapping]:
+        items = []
+        abs_collection = await self._client.get_collection(collection_id=collection_id)
+        for book in abs_collection.books:
+            mass_item = await self.mass.music.get_library_item_by_prov_id(
+                media_type=MediaType.AUDIOBOOK,
+                item_id=book.id_,
+                provider_instance_id_or_domain=self.instance_id,
+            )
+            if mass_item is not None:
+                items.append(mass_item)
+        return items
 
-        # HANDLE ROOT PATH
-        if item_path == "audiobooks":
-            library_list = self._client.audiobook_libraries
-            return await self._browse_root(library_list, item_path)
-        elif item_path == "podcasts":
-            library_list = self._client.podcast_libraries
-            return await self._browse_root(library_list, item_path)
+    async def _socket_abs_item_changed(
+        self, items: LibraryItemExpanded | list[LibraryItemExpanded]
+    ) -> None:
+        """For added and updated."""
+        abs_items = [items] if isinstance(items, LibraryItemExpanded) else items
+        for abs_item in abs_items:
+            if isinstance(abs_item, LibraryItemExpandedBook):
+                self.logger.debug(
+                    'Updated book "%s" via socket.', abs_item.media.metadata.title or ""
+                )
+                await self.mass.music.audiobooks.add_item_to_library(
+                    parse_audiobook(
+                        abs_audiobook=abs_item,
+                        lookup_key=self.lookup_key,
+                        domain=self.domain,
+                        instance_id=self.instance_id,
+                        token=self._client.token,
+                        base_url=str(self.config.get_value(CONF_URL)).rstrip("/"),
+                    ),
+                    overwrite_existing=True,
+                )
+                lib = self.libraries.audiobooks.get(abs_item.library_id, None)
+                if lib is not None:
+                    lib.item_ids.add(abs_item.id_)
+            elif isinstance(abs_item, LibraryItemExpandedPodcast):
+                self.logger.debug(
+                    'Updated podcast "%s" via socket.', abs_item.media.metadata.title or ""
+                )
+                mass_podcast = parse_podcast(
+                    abs_podcast=abs_item,
+                    lookup_key=self.lookup_key,
+                    domain=self.domain,
+                    instance_id=self.instance_id,
+                    token=self._client.token,
+                    base_url=str(self.config.get_value(CONF_URL)).rstrip("/"),
+                )
+                if not (
+                    bool(self.config.get_value(CONF_HIDE_EMPTY_PODCASTS))
+                    and mass_podcast.total_episodes == 0
+                ):
+                    await self.mass.music.podcasts.add_item_to_library(
+                        mass_podcast,
+                        overwrite_existing=True,
+                    )
+                    lib = self.libraries.podcasts.get(abs_item.library_id, None)
+                    if lib is not None:
+                        lib.item_ids.add(abs_item.id_)
+        await self._cache_set_helper_libraries()
 
-        # HANDLE WITHIN LIBRARY
-        library_type, library_id = item_path.split("/")
-        if library_type == "audiobooks":
-            library_list = self._client.audiobook_libraries
-            media_type = MediaType.AUDIOBOOK
-        elif library_type == "podcasts":
-            library_list = self._client.podcast_libraries
-            media_type = MediaType.PODCAST
-        else:
-            raise MediaNotFoundError("Specified Lib Type unknown")
+    async def _socket_abs_item_removed(self, item: LibraryItemRemoved) -> None:
+        """Item removed."""
+        media_type: MediaType | None = None
+        for lib in self.libraries.audiobooks.values():
+            if item.id_ in lib.item_ids:
+                media_type = MediaType.AUDIOBOOK
+                lib.item_ids.remove(item.id_)
+                break
+        for lib in self.libraries.podcasts.values():
+            if item.id_ in lib.item_ids:
+                media_type = MediaType.PODCAST
+                lib.item_ids.remove(item.id_)
+                break
 
-        return await self._browse_lib(library_id, library_list, media_type)
+        if media_type is not None:
+            mass_item = await self.mass.music.get_library_item_by_prov_id(
+                media_type=media_type,
+                item_id=item.id_,
+                provider_instance_id_or_domain=self.instance_id,
+            )
+            if mass_item is not None:
+                await self.mass.music.remove_item_from_library(
+                    media_type=media_type, library_item_id=mass_item.item_id
+                )
+                self.logger.debug('Removed %s "%s" via socket.', media_type.value, mass_item.name)
+
+        await self._cache_set_helper_libraries()
+
+    async def _cache_set_helper_libraries(self) -> None:
+        await self.mass.cache.set(
+            key=CACHE_KEY_LIBRARIES,
+            base_key=self.cache_base_key,
+            category=CACHE_CATEGORY_LIBRARIES,
+            data=self.libraries.to_dict(),
+        )

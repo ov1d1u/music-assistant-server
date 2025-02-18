@@ -82,7 +82,7 @@ ESPHOME_V2_MODELS_PLAYER_CONFIG_ENTRIES = (
     CONF_ENTRY_CROSSFADE_DURATION,
     CONF_ENTRY_FLOW_MODE_ENFORCED,
     CONF_ENTRY_HTTP_PROFILE_FORCED_2,
-    create_sample_rates_config_entry(48000, 16, hidden=True),
+    create_sample_rates_config_entry(48000, 16, hidden=True, supported_sample_rates=[48000]),
     # although the Voice PE supports announcements, it does not support volume for announcements
     *HIDDEN_ANNOUNCE_VOLUME_CONFIG_ENTRIES,
 )
@@ -272,6 +272,7 @@ class HomeAssistantPlayers(PlayerProvider):
         if player := self.mass.players.get(player_id):
             player.elapsed_time = 0
             player.elapsed_time_last_updated = time.time()
+            player.current_media = media
 
     async def play_announcement(
         self, player_id: str, announcement: PlayerMedia, volume_level: int | None = None
