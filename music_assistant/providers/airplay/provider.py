@@ -296,12 +296,13 @@ class AirplayProvider(PlayerProvider):
         player = self.mass.players.get(player_id)
         if not player:
             return
-        # set the active source for the player to the media queue
-        # this accounts for syncgroups and linked players (e.g. sonos)
-        player.active_source = media.queue_id
         if player.synced_to:
             # should not happen, but just in case
             raise RuntimeError("Player is synced")
+        # set the active source for the player to the media queue
+        # this accounts for syncgroups and linked players (e.g. sonos)
+        player.active_source = media.queue_id
+        player.current_media = media
         # always stop existing stream first
         async with TaskManager(self.mass) as tg:
             for airplay_player in self._get_sync_clients(player_id):

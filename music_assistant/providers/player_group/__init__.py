@@ -103,10 +103,10 @@ CONF_ENTRY_GROUP_TYPE = ConfigEntry(
 CONF_ENTRY_GROUP_MEMBERS = ConfigEntry(
     key=CONF_GROUP_MEMBERS,
     type=ConfigEntryType.STRING,
+    multi_value=True,
     label="Group members",
     default_value=[],
     description="Select all players you want to be part of this group",
-    multi_value=True,
     required=False,  # otherwise dynamic members won't work (which allows empty members list)
 )
 CONF_ENTRY_SAMPLE_RATES_UGP = create_sample_rates_config_entry(44100, 16, 44100, 16, True)
@@ -705,6 +705,7 @@ class PlayerGroupProvider(PlayerProvider):
             # this is the sync leader, unsync all its childs!
             # NOTE that some players/providers might support this in a less intrusive way
             # but for now we just ungroup all childs to keep thinngs universal
+            self.logger.info("Detected ungroup of sync leader, ungrouping all childs")
             async with TaskManager(self.mass) as tg:
                 for sync_child_id in child_player.group_childs:
                     if sync_child_id == child_player.player_id:
@@ -717,6 +718,7 @@ class PlayerGroupProvider(PlayerProvider):
 
         if is_sync_leader and was_playing and group_player.powered:
             # ungrouping the sync leader stops the group so we need to resume
+            self.logger.info("Resuming group after ungrouping of sync leader")
             task_id = f"resync_group_{group_player.player_id}"
             self.mass.call_later(
                 2, self.mass.players.cmd_play(group_player.player_id), task_id=task_id
@@ -922,6 +924,8 @@ class PlayerGroupProvider(PlayerProvider):
         # Verify that no player is part of a separate group
         for child_player_id in player.group_childs:
             child_player = self.mass.players.get(child_player_id)
+            if child_player is None:
+                continue
             if PlayerFeature.SET_MEMBERS not in child_player.supported_features:
                 continue
             if child_player.group_childs:

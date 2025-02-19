@@ -843,4 +843,7 @@ class MusicAssistant:
             if filename.startswith(("spotify", "collage")):
                 old_loc = os.path.join(self.storage_path, filename)
                 new_loc = os.path.join(self.cache_path, filename)
-                await rename(old_loc, new_loc)
+                if await isfile(new_loc):
+                    await rmfile(old_loc)
+                else:
+                    await rename(old_loc, new_loc)

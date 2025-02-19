@@ -324,6 +324,8 @@ class SonosPlayerProvider(PlayerProvider):
 
         if media.queue_id and media.queue_id.startswith("ugp_"):
             # Special UGP stream - handle with play URL
+            # enforce mp3 here because Sonos really does not support FLAC streams without duration
+            media.uri = media.uri.replace(".flac", ".mp3")
             await sonos_player.client.player.group.play_stream_url(media.uri, None)
             return
 
