@@ -9,13 +9,7 @@ from collections.abc import Iterable
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
-from music_assistant_models.enums import (
-    CacheCategory,
-    EventType,
-    ExternalID,
-    MediaType,
-    ProviderFeature,
-)
+from music_assistant_models.enums import EventType, ExternalID, MediaType, ProviderFeature
 from music_assistant_models.errors import MediaNotFoundError, ProviderUnavailableError
 from music_assistant_models.media_items import (
     Album,
@@ -26,8 +20,14 @@ from music_assistant_models.media_items import (
     Track,
 )
 
-from music_assistant.constants import DB_TABLE_PLAYLOG, DB_TABLE_PROVIDER_MAPPINGS, MASS_LOGGER_NAME
-from music_assistant.helpers.compare import compare_media_item
+from music_assistant.constants import (
+    CACHE_CATEGORY_MUSIC_PROVIDER_ITEM,
+    CACHE_CATEGORY_MUSIC_SEARCH,
+    DB_TABLE_PLAYLOG,
+    DB_TABLE_PROVIDER_MAPPINGS,
+    MASS_LOGGER_NAME,
+)
+from music_assistant.helpers.compare import compare_media_item, create_safe_string
 from music_assistant.helpers.json import json_loads, serialize_to_json
 
 if TYPE_CHECKING:
@@ -50,10 +50,15 @@ JSON_KEYS = (
 )
 
 SORT_KEYS = {
-    "name": "name COLLATE NOCASE ASC",
-    "name_desc": "name COLLATE NOCASE DESC",
-    "sort_name": "sort_name COLLATE NOCASE ASC",
-    "sort_name_desc": "sort_name COLLATE NOCASE DESC",
+    # sqlite has no builtin support for natural sorting
+    # so we have use an additional column for this
+    # this also improves searching and sorting performance
+    "name": "search_name ASC",
+    "name_desc": "search_name DESC",
+    "duration": "duration ASC",
+    "duration_desc": "duration DESC",
+    "sort_name": "search_sort_name ASC",
+    "sort_name_desc": "search_sort_name DESC",
     "timestamp_added": "timestamp_added ASC",
     "timestamp_added_desc": "timestamp_added DESC",
     "timestamp_modified": "timestamp_modified ASC",
@@ -66,8 +71,8 @@ SORT_KEYS = {
     "year_desc": "year DESC",
     "position": "position ASC",
     "position_desc": "position DESC",
-    "artist_name": "artists.name COLLATE NOCASE ASC",
-    "artist_name_desc": "artists.name COLLATE NOCASE DESC",
+    "artist_name": "artists.search_name ASC",
+    "artist_name_desc": "artists.search_name DESC",
     "random": "RANDOM()",
     "random_play_count": "RANDOM(), play_count ASC",
 }
@@ -312,7 +317,7 @@ class MediaControllerBase(Generic[ItemCls], metaclass=ABCMeta):
             return []
 
         # prefer cache items (if any)
-        cache_category = CacheCategory.MUSIC_SEARCH
+        cache_category = CACHE_CATEGORY_MUSIC_SEARCH
         cache_base_key = prov.lookup_key
         cache_key = f"{search_query}.{limit}.{self.media_type.value}"
         if (
@@ -531,7 +536,7 @@ class MediaControllerBase(Generic[ItemCls], metaclass=ABCMeta):
         if not (provider := self.mass.get_provider(provider_instance_id_or_domain)):
             raise ProviderUnavailableError(f"{provider_instance_id_or_domain} is not available")
 
-        cache_category = CacheCategory.MUSIC_PROVIDER_ITEM
+        cache_category = CACHE_CATEGORY_MUSIC_PROVIDER_ITEM
         cache_base_key = provider.lookup_key
         cache_key = f"{self.media_type.value}.{item_id}"
         if not force_refresh and (
@@ -710,15 +715,16 @@ class MediaControllerBase(Generic[ItemCls], metaclass=ABCMeta):
         query_parts: list[str] = extra_query_parts or []
         join_parts: list[str] = extra_join_parts or []
         # create special performant random query
-        if order_by and order_by.startswith("random"):
+        if not search and order_by and order_by.startswith("random"):
             query_parts.append(
                 f"{self.db_table}.item_id in "
                 f"(SELECT item_id FROM {self.db_table} ORDER BY RANDOM() LIMIT {limit})"
             )
         # handle search
         if search:
+            search = create_safe_string(search, True, True)
             query_params["search"] = f"%{search}%"
-            query_parts.append(f"{self.db_table}.name LIKE :search")
+            query_parts.append(f"{self.db_table}.search_name LIKE :search")
         # handle favorite filter
         if favorite is not None:
             query_parts.append(f"{self.db_table}.favorite = :favorite")
@@ -805,16 +811,17 @@ class MediaControllerBase(Generic[ItemCls], metaclass=ABCMeta):
             db_row_dict["disc_number"] = track_album["disc_number"]
             db_row_dict["track_number"] = track_album["track_number"]
             # always prefer album image over track image
-            if images := track_album.get("images"):
-                album_thumb = next((x for x in images if x["type"] == "thumb"), None)
-                if album_thumb:
-                    # copy album image to itemmapping single image
-                    db_row_dict["image"] = album_thumb
-                    if db_row_dict["metadata"].get("images"):
-                        db_row_dict["metadata"]["images"] = [
-                            album_thumb,
-                            *db_row_dict["metadata"]["images"],
-                        ]
-                    else:
-                        db_row_dict["metadata"]["images"] = [album_thumb]
+            if (album_images := track_album.get("images")) and (
+                album_thumb := next((x for x in album_images if x["type"] == "thumb"), None)
+            ):
+                # copy album image to itemmapping single image
+                db_row_dict["image"] = album_thumb
+                if db_row_dict["metadata"].get("images"):
+                    # merge album image with existing images
+                    db_row_dict["metadata"]["images"] = [
+                        album_thumb,
+                        *db_row_dict["metadata"]["images"],
+                    ]
+                else:
+                    db_row_dict["metadata"]["images"] = [album_thumb]
         return db_row_dict

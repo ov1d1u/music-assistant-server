@@ -208,7 +208,8 @@ async def get_track_lyrics(session: TidalSession, prov_track_id: str) -> TidalLy
             raise MediaNotFoundError(msg) from err
         except MetadataNotAvailable as err:
             msg = f"Lyrics not available for track {prov_track_id}"
-            raise MediaNotFoundError(msg) from err
+            LOGGER.debug(msg)
+            raise MetadataNotAvailable(msg) from err
         except TooManyRequests:
             msg = "Tidal API rate limit reached"
             raise ResourceTemporarilyUnavailable(msg)
@@ -419,5 +420,14 @@ async def search(
         models = search_types
         results: dict[str, str] = session.search(query, models, limit, offset)
         return results
+
+    return await asyncio.to_thread(inner)
+
+
+async def token_refresh(session: TidalSession) -> None:
+    """Async wrapper around the tidalapi Session.refresh function."""
+
+    def inner() -> None:
+        session.token_refresh(session.refresh_token)
 
     return await asyncio.to_thread(inner)

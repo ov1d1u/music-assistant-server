@@ -139,6 +139,8 @@ class MusicAssistant:
                 limit_per_host=100,
             ),
         )
+        # load all available providers from manifest files
+        await self.__load_provider_manifests()
         # setup config controller first and fetch important config values
         self.config = ConfigController(self)
         await self.config.setup()
@@ -174,8 +176,6 @@ class MusicAssistant:
         # not yet available while we're starting (or performing migrations)
         self._register_api_commands()
         await self.webserver.setup(await self.config.get_core_config("webserver"))
-        # load all available providers from manifest files
-        await self.__load_provider_manifests()
         # setup discovery
         await self._setup_discovery()
         # load providers
@@ -446,6 +446,16 @@ class MusicAssistant:
         msg = "Task does not exist"
         raise KeyError(msg)
 
+    def cancel_task(self, task_id: str) -> None:
+        """Cancel existing scheduled task."""
+        if existing := self._tracked_tasks.pop(task_id, None):
+            existing.cancel()
+
+    def cancel_timer(self, task_id: str) -> None:
+        """Cancel existing scheduled timer."""
+        if existing := self._tracked_timers.pop(task_id, None):
+            existing.cancel()
+
     def register_api_command(
         self,
         command: str,
@@ -577,6 +587,11 @@ class MusicAssistant:
                 await self._update_available_providers_cache()
                 self.signal_event(EventType.PROVIDERS_UPDATED, data=self.get_providers())
 
+    async def unload_provider_with_error(self, instance_id: str, error: str) -> None:
+        """Unload a provider when it got into trouble which needs user interaction."""
+        self.config.set(f"{CONF_PROVIDERS}/{instance_id}/last_error", error)
+        await self.unload_provider(instance_id)
+
     def _register_api_commands(self) -> None:
         """Register all methods decorated as api_command within a class(instance)."""
         for cls in (
@@ -655,15 +670,22 @@ class MusicAssistant:
             msg = f"Provider {domain} did not load within 30 seconds"
             raise SetupFailedError(msg) from err
 
-        self._providers[provider.instance_id] = provider
         # run async setup
         await provider.handle_async_init()
 
+        # TEMP workaround
+        # cleanup wrong name config value (set to provider name)
+        # remove after 2.4 release
+        if conf.name == prov_manifest.name:
+            self.config.set_raw_provider_config_value(provider.instance_id, "name", None)
+            provider.config.name = None
+
         # if we reach this point, the provider loaded successfully
+        self._providers[provider.instance_id] = provider
         LOGGER.info(
             "Loaded %s provider %s",
             provider.type.value,
-            conf.name or conf.domain,
+            provider.name,
         )
         provider.available = True
 

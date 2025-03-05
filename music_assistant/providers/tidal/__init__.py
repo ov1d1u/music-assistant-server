@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, ParamSpec, TypeVar, cast
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption, ConfigValueType
 from music_assistant_models.enums import (
     AlbumType,
-    CacheCategory,
     ConfigEntryType,
     ContentType,
     ExternalID,
@@ -46,6 +45,7 @@ from tidalapi import Session as TidalSession
 from tidalapi import Track as TidalTrack
 from tidalapi import exceptions as tidal_exceptions
 
+from music_assistant.constants import CACHE_CATEGORY_DEFAULT, CACHE_CATEGORY_MEDIA_INFO
 from music_assistant.helpers.auth import AuthenticationHelper
 from music_assistant.helpers.tags import AudioTags, async_parse_tags
 from music_assistant.helpers.throttle_retry import ThrottlerManager, throttle_with_retries
@@ -354,24 +354,13 @@ class TidalProvider(MusicProvider):
     _tidal_session: TidalSession | None = None
     _tidal_user_id: str
     # rate limiter needs to be specified on provider-level,
-    # so make it an instance attribute
+    # so make it an class attribute
     throttler = ThrottlerManager(rate_limit=1, period=2)
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
         self._tidal_user_id = str(self.config.get_value(CONF_USER_ID))
-        try:
-            self._tidal_session = await self._get_tidal_session()
-        except Exception as err:
-            if "401 Client Error: Unauthorized" in str(err):
-                self.mass.config.set_raw_provider_config_value(
-                    self.instance_id, CONF_AUTH_TOKEN, None
-                )
-                self.mass.config.set_raw_provider_config_value(
-                    self.instance_id, CONF_REFRESH_TOKEN, None
-                )
-                raise LoginFailed("Credentials expired, you need to re-setup")
-            raise
+        await self._get_tidal_session()
 
     @property
     def supported_features(self) -> set[ProviderFeature]:
@@ -676,27 +665,38 @@ class TidalProvider(MusicProvider):
             > (datetime.now() + timedelta(days=1))
         ):
             return self._tidal_session
-        self._tidal_session = await self._load_tidal_session(
-            token_type="Bearer",
-            quality=str(self.config.get_value(CONF_QUALITY)),
-            access_token=str(self.config.get_value(CONF_AUTH_TOKEN)),
-            refresh_token=str(self.config.get_value(CONF_REFRESH_TOKEN)),
-            expiry_time=datetime.fromisoformat(str(self.config.get_value(CONF_EXPIRY_TIME))),
-        )
-        self.mass.config.set_raw_provider_config_value(
-            self.config.instance_id,
+
+        try:
+            self._tidal_session = await self._load_tidal_session(
+                token_type="Bearer",
+                quality=str(self.config.get_value(CONF_QUALITY)),
+                access_token=str(self.config.get_value(CONF_AUTH_TOKEN)),
+                refresh_token=str(self.config.get_value(CONF_REFRESH_TOKEN)),
+                expiry_time=datetime.fromisoformat(str(self.config.get_value(CONF_EXPIRY_TIME))),
+            )
+        except Exception as err:
+            if "401 Client Error: Unauthorized" in str(err):
+                err_msg = "Credentials expired, you need to re-setup"
+                # clear stored creds
+                self.update_config_value(CONF_AUTH_TOKEN, None)
+                self.update_config_value(CONF_REFRESH_TOKEN, None)
+                # if we're already loaded and the login got invalid, we need to unload
+                if self.available:
+                    self.unload_with_error(err_msg)
+                raise LoginFailed(err_msg)
+            raise
+
+        self.update_config_value(
             CONF_AUTH_TOKEN,
             self._tidal_session.access_token,
             encrypted=True,
         )
-        self.mass.config.set_raw_provider_config_value(
-            self.config.instance_id,
+        self.update_config_value(
             CONF_REFRESH_TOKEN,
             self._tidal_session.refresh_token,
             encrypted=True,
         )
-        self.mass.config.set_raw_provider_config_value(
-            self.config.instance_id,
+        self.update_config_value(
             CONF_EXPIRY_TIME,
             self._tidal_session.expiry_time.isoformat(),
         )
@@ -733,7 +733,7 @@ class TidalProvider(MusicProvider):
         # Try to get from cache first
         cache_key = f"isrc_map_{item_id}"
         cached_track_id = await self.mass.cache.get(
-            cache_key, category=CacheCategory.DEFAULT, base_key=self.lookup_key
+            cache_key, category=CACHE_CATEGORY_DEFAULT, base_key=self.lookup_key
         )
 
         if cached_track_id:
@@ -745,7 +745,7 @@ class TidalProvider(MusicProvider):
             except MediaNotFoundError:
                 # Track no longer exists, invalidate cache
                 await self.mass.cache.delete(
-                    cache_key, category=CacheCategory.DEFAULT, base_key=self.lookup_key
+                    cache_key, category=CACHE_CATEGORY_DEFAULT, base_key=self.lookup_key
                 )
 
         # Lookup by ISRC if no cache or cached track not found
@@ -773,7 +773,7 @@ class TidalProvider(MusicProvider):
 
         # Cache the mapping for future use
         await self.mass.cache.set(
-            cache_key, tracks[0].id, category=CacheCategory.DEFAULT, base_key=self.lookup_key
+            cache_key, tracks[0].id, category=CACHE_CATEGORY_DEFAULT, base_key=self.lookup_key
         )
 
         return tracks[0]
@@ -1001,7 +1001,7 @@ class TidalProvider(MusicProvider):
         self, item_id: str, url: str, force_refresh: bool = False
     ) -> AudioTags:
         """Retrieve (cached) mediainfo for track."""
-        cache_category = CacheCategory.MEDIA_INFO
+        cache_category = CACHE_CATEGORY_MEDIA_INFO
         cache_base_key = self.lookup_key
         # do we have some cached info for this url ?
         cached_info = await self.mass.cache.get(

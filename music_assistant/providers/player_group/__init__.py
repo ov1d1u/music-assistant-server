@@ -46,7 +46,6 @@ from music_assistant.constants import (
     CONF_CROSSFADE,
     CONF_CROSSFADE_DURATION,
     CONF_ENABLE_ICY_METADATA,
-    CONF_ENFORCE_MP3,
     CONF_ENTRY_CROSSFADE,
     CONF_ENTRY_CROSSFADE_DURATION,
     CONF_ENTRY_FLOW_MODE_ENFORCED,
@@ -55,6 +54,7 @@ from music_assistant.constants import (
     CONF_GROUP_MEMBERS,
     CONF_HTTP_PROFILE,
     CONF_MUTE_CONTROL,
+    CONF_OUTPUT_CODEC,
     CONF_POWER_CONTROL,
     CONF_SAMPLE_RATES,
     CONF_VOLUME_CONTROL,
@@ -109,7 +109,9 @@ CONF_ENTRY_GROUP_MEMBERS = ConfigEntry(
     description="Select all players you want to be part of this group",
     required=False,  # otherwise dynamic members won't work (which allows empty members list)
 )
-CONF_ENTRY_SAMPLE_RATES_UGP = create_sample_rates_config_entry(44100, 16, 44100, 16, True)
+CONF_ENTRY_SAMPLE_RATES_UGP = create_sample_rates_config_entry(
+    max_sample_rate=96000, max_bit_depth=24, hidden=True
+)
 CONFIG_ENTRY_UGP_NOTE = ConfigEntry(
     key="ugp_note",
     type=ConfigEntryType.LABEL,
@@ -180,10 +182,16 @@ class PlayerGroupProvider(PlayerProvider):
         # temp: migrate old config entries
         # remove this after MA 2.4 release
         for player_config in await self.mass.config.get_player_configs(include_values=True):
+            # migrate provider set to domain to instance_id
+            if player_config.provider == self.manifest.domain:
+                self.mass.config.set_raw_player_config_value(
+                    player_config.player_id, "provider", self.instance_id
+                )
+                player_config.provider = self.instance_id
+            # migrate old syncgroup/UGP players to this provider
             if player_config.values.get(CONF_GROUP_TYPE) is not None:
                 # already migrated
                 continue
-            # migrate old syncgroup players to this provider
             if player_config.player_id.startswith(SYNCGROUP_PREFIX):
                 self.mass.config.set_raw_player_config_value(
                     player_config.player_id, CONF_GROUP_TYPE, player_config.provider
@@ -192,7 +200,6 @@ class PlayerGroupProvider(PlayerProvider):
                 self.mass.config.set_raw_player_config_value(
                     player_config.player_id, "provider", self.instance_id
                 )
-            # migrate old UGP players to this provider
             elif player_config.player_id.startswith(UNIVERSAL_PREFIX):
                 self.mass.config.set_raw_player_config_value(
                     player_config.player_id, CONF_GROUP_TYPE, "universal"
@@ -289,7 +296,7 @@ class PlayerGroupProvider(PlayerProvider):
             return base_entries  # guard
         if TYPE_CHECKING:
             player_provider = cast(PlayerProvider, player_provider)
-        assert player_provider.lookup_key != self.lookup_key
+        assert player_provider.instance_id != self.instance_id
         if not (child_player := next((x for x in player_provider.players), None)):
             return base_entries  # guard
 
@@ -299,7 +306,7 @@ class PlayerGroupProvider(PlayerProvider):
             CONF_ENABLE_ICY_METADATA,
             CONF_CROSSFADE,
             CONF_CROSSFADE_DURATION,
-            CONF_ENFORCE_MP3,
+            CONF_OUTPUT_CODEC,
             CONF_FLOW_MODE,
             CONF_SAMPLE_RATES,
         )
@@ -484,9 +491,9 @@ class PlayerGroupProvider(PlayerProvider):
         elif media.media_type == MediaType.PLUGIN_SOURCE:
             # special case: plugin source stream
             audio_source = self.mass.streams.get_plugin_source_stream(
-                plugin_source_id=media.custom_data["provider"],
+                plugin_source_id=media.custom_data["source_id"],
                 output_format=UGP_FORMAT,
-                player_id=player_id,
+                player_id=media.custom_data["player_id"],
             )
         elif media.media_type == MediaType.RADIO:
             # use single item stream request for radio streams
@@ -564,7 +571,8 @@ class PlayerGroupProvider(PlayerProvider):
         """
         if group_player := self.mass.players.get(player_id):
             self._update_attributes(group_player)
-            await self._ungroup_subgroups_if_found(group_player)
+            if group_player.powered:
+                await self._ungroup_subgroups_if_found(group_player)
 
     async def create_group(
         self, group_type: str, name: str, members: list[str], dynamic: bool = False
@@ -581,7 +589,7 @@ class PlayerGroupProvider(PlayerProvider):
             if ProviderFeature.SYNC_PLAYERS not in player_prov.supported_features:
                 msg = f"Provider {player_prov.name} does not support creating groups"
                 raise UnsupportedFeaturedException(msg)
-            group_type = player_prov.lookup_key  # just in case only domain was sent
+            group_type = player_prov.instance_id  # just in case only domain was sent
 
         new_group_id = f"{prefix}{shortuuid.random(8).lower()}"
         # cleanup list, just in case the frontend sends some garbage
@@ -727,7 +735,7 @@ class PlayerGroupProvider(PlayerProvider):
     async def _register_all_players(self) -> None:
         """Register all (virtual/fake) group players in the Player controller."""
         player_configs = await self.mass.config.get_player_configs(
-            self.lookup_key, include_values=True
+            self.instance_id, include_values=True
         )
         for player_config in player_configs:
             if self.mass.players.get(player_config.player_id):
@@ -770,9 +778,9 @@ class PlayerGroupProvider(PlayerProvider):
             )
             can_group_with = {
                 # allow grouping with all providers, except the playergroup provider itself
-                x.lookup_key
+                x.instance_id
                 for x in self.mass.players.providers
-                if x.lookup_key != self.lookup_key
+                if x.instance_id != self.instance_id
             }
             player_features.add(PlayerFeature.MULTI_DEVICE_DSP)
         elif player_provider := self.mass.get_provider(group_type):
@@ -781,7 +789,7 @@ class PlayerGroupProvider(PlayerProvider):
                 player_provider = cast(PlayerProvider, player_provider)
             model_name = "Sync Group"
             manufacturer = self.mass.get_provider(group_type).name
-            can_group_with = {player_provider.lookup_key}
+            can_group_with = {player_provider.instance_id}
             for feature in (PlayerFeature.PAUSE, PlayerFeature.VOLUME_MUTE, PlayerFeature.ENQUEUE):
                 if all(feature in x.supported_features for x in player_provider.players):
                     player_features.add(feature)
@@ -797,7 +805,7 @@ class PlayerGroupProvider(PlayerProvider):
 
         player = Player(
             player_id=group_player_id,
-            provider=self.lookup_key,
+            provider=self.instance_id,
             type=PlayerType.GROUP,
             name=name,
             available=True,
@@ -901,12 +909,12 @@ class PlayerGroupProvider(PlayerProvider):
         if group_type == GROUP_TYPE_UNIVERSAL:
             can_group_with = {
                 # allow grouping with all providers, except the playergroup provider itself
-                x.lookup_key
+                x.instance_id
                 for x in self.mass.players.providers
-                if x.lookup_key != self.lookup_key
+                if x.instance_id != self.instance_id
             }
         elif sync_player_provider := self.mass.get_provider(group_type):
-            can_group_with = {sync_player_provider.lookup_key}
+            can_group_with = {sync_player_provider.instance_id}
         else:
             can_group_with = {}
         player.can_group_with = can_group_with
@@ -1025,7 +1033,7 @@ class PlayerGroupProvider(PlayerProvider):
                 x
                 for x in members
                 if (player := self.mass.players.get(x))
-                and player.provider == player_provider.lookup_key
+                and player.provider == player_provider.instance_id
             ]
         # cleanup members - filter out impossible choices
         syncgroup_childs: list[str] = []

@@ -37,6 +37,8 @@ from music_assistant.constants import (
     CONF_DEPRECATED_EQ_BASS,
     CONF_DEPRECATED_EQ_MID,
     CONF_DEPRECATED_EQ_TREBLE,
+    CONF_ONBOARD_DONE,
+    CONF_OUTPUT_LIMITER,
     CONF_PLAYER_DSP,
     CONF_PLAYERS,
     CONF_PROVIDERS,
@@ -97,7 +99,7 @@ class ConfigController:
     @property
     def onboard_done(self) -> bool:
         """Return True if onboarding is done."""
-        return len(self._data.get(CONF_PROVIDERS, {})) > 0
+        return self.get(CONF_ONBOARD_DONE, False)
 
     async def close(self) -> None:
         """Handle logic on server stop."""
@@ -276,6 +278,9 @@ class ConfigController:
             config = await self._update_provider_config(instance_id, values)
         else:
             config = await self._add_provider_config(provider_domain, values)
+        # mark onboard done whenever the (first) provider is added
+        # this will be replaced later by a more sophisticated onboarding process
+        self.set(CONF_ONBOARD_DONE, True)
         # return full config, just in case
         return await self.get_provider_config(config.instance_id)
 
@@ -302,6 +307,10 @@ class ConfigController:
                 if player.provider != instance_id:
                     continue
                 self.mass.players.remove(player.player_id, cleanup_config=True)
+            # cleanup remaining player configs
+            for player_conf in list(self.get(CONF_PLAYERS, {}).values()):
+                if player_conf["provider"] == instance_id:
+                    self.remove(f"{CONF_PLAYERS}/{player_conf['player_id']}")
 
     async def remove_provider_config_value(self, instance_id: str, key: str) -> None:
         """Remove/reset single Provider config value."""
@@ -315,7 +324,7 @@ class ConfigController:
     async def get_player_configs(
         self, provider: str | None = None, include_values: bool = False
     ) -> list[PlayerConfig]:
-        """Return all known player configurations, optionally filtered by provider domain."""
+        """Return all known player configurations, optionally filtered by provider id."""
         return [
             await self.get_player_config(raw_conf["player_id"])
             if include_values
@@ -397,13 +406,15 @@ class ConfigController:
         # actually store changes (if the above did not raise)
         conf_key = f"{CONF_PLAYERS}/{player_id}"
         self.set(conf_key, config.to_raw())
+        # always update player attributes to calculate e.g. player controls etc.
+        self.mass.players.update(config.player_id, force_update=True)
         # send config updated event
         self.mass.signal_event(
             EventType.PLAYER_CONFIG_UPDATED,
             object_id=config.player_id,
             data=config,
         )
-        self.mass.players.update(config.player_id, force_update=True)
+
         # return full player config (just in case)
         return await self.get_player_config(player_id)
 
@@ -566,7 +577,10 @@ class ConfigController:
             msg = f"Unknown provider domain: {provider_domain}"
             raise KeyError(msg)
         config_entries = await self.get_provider_config_entries(provider_domain)
-        instance_id = f"{manifest.domain}--{shortuuid.random(8)}"
+        if manifest.multi_instance:
+            instance_id = f"{manifest.domain}--{shortuuid.random(8)}"
+        else:
+            instance_id = manifest.domain
         default_config: ProviderConfig = ProviderConfig.parse(
             config_entries,
             {
@@ -707,9 +721,6 @@ class ConfigController:
             self.set(f"{CONF_PROVIDERS}/{provider_instance}/{key}", value)
             return
         self.set(f"{CONF_PROVIDERS}/{provider_instance}/values/{key}", value)
-        # also update the cached value in the provider itself
-        if prov := self.mass.get_provider(provider_instance, return_unavailable=True):
-            prov.config.values[key].value = value
 
     def set_raw_core_config_value(self, core_module: str, key: str, value: ConfigValueType) -> None:
         """
@@ -812,6 +823,33 @@ class ConfigController:
                 for x in sample_rates
             ]
             changed = True
+        # migrate DSPConfig.output_limiter
+        for player_id, dsp_config in list(self._data.get(CONF_PLAYER_DSP, {}).items()):
+            output_limiter = dsp_config.get("output_limiter")
+            enabled = dsp_config.get("enabled")
+            if output_limiter is None or enabled is None or output_limiter:
+                continue
+
+            if enabled:
+                # The DSP is enabled, and the user disabled the output limiter in a prior version
+                # Migrate the output limiter option to the player config
+                if (players := self._data.get(f"{CONF_PLAYERS}")) and (
+                    player := players.get(player_id)
+                ):
+                    player["values"][CONF_OUTPUT_LIMITER] = False
+            # Delete the old option, so this migration logic will never be called
+            # anymore for this player.
+            del dsp_config["output_limiter"]
+            changed = True
+
+        # set 'onboard_done' flag if we have any (non default) provider configs
+        if not self._data.get(CONF_ONBOARD_DONE):
+            default_providers = {x.domain for x in self.mass.get_provider_manifests() if x.builtin}
+            for provider_config in self._data.get(CONF_PROVIDERS, {}).values():
+                if provider_config["domain"] not in default_providers:
+                    self._data[CONF_ONBOARD_DONE] = True
+                    changed = True
+                    break
 
         if changed:
             await self._async_save()
@@ -910,7 +948,10 @@ class ConfigController:
         if existing and not manifest.multi_instance:
             msg = f"Provider {manifest.name} does not support multiple instances"
             raise ValueError(msg)
-        instance_id = f"{manifest.domain}--{shortuuid.random(8)}"
+        if manifest.multi_instance:
+            instance_id = f"{manifest.domain}--{shortuuid.random(8)}"
+        else:
+            instance_id = manifest.domain
         # all checks passed, create config object
         config_entries = await self.get_provider_config_entries(
             provider_domain=provider_domain, instance_id=instance_id, values=values

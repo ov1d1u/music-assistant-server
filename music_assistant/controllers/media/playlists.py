@@ -6,7 +6,7 @@ import time
 from collections.abc import AsyncGenerator
 from typing import Any
 
-from music_assistant_models.enums import CacheCategory, MediaType, ProviderFeature
+from music_assistant_models.enums import MediaType, ProviderFeature
 from music_assistant_models.errors import (
     InvalidDataError,
     MediaNotFoundError,
@@ -14,7 +14,12 @@ from music_assistant_models.errors import (
 )
 from music_assistant_models.media_items import Playlist, Track
 
-from music_assistant.constants import DB_TABLE_PLAYLISTS
+from music_assistant.constants import (
+    CACHE_CATEGORY_MUSIC_PLAYLIST_TRACKS,
+    CACHE_CATEGORY_MUSIC_PROVIDER_ITEM,
+    DB_TABLE_PLAYLISTS,
+)
+from music_assistant.helpers.compare import create_safe_string
 from music_assistant.helpers.json import serialize_to_json
 from music_assistant.helpers.uri import create_uri, parse_uri
 from music_assistant.models.music_provider import MusicProvider
@@ -115,10 +120,41 @@ class PlaylistController(MediaControllerBase[Playlist]):
             cur_playlist_track_uris.add(item.item_id)
             cur_playlist_track_uris.add(item.uri)
 
+        # unwrap all uri's to track uri's
+        unwrapped_uris: list[str] = []
+        for uri in uris:
+            # URI could be a playlist or album uri, unwrap it
+            if not ("://" in uri and len(uri.split("/")) >= 4):
+                # NOT a music assistant-style uri (provider://media_type/item_id)
+                self.logger.warning(
+                    "Not adding %s to playlist %s - not a valid uri", uri, playlist.name
+                )
+                continue
+            # music assistant-style uri
+            # provider://media_type/item_id
+            provider_instance_id_or_domain, rest = uri.split("://", 1)
+            media_type_str, item_id = rest.split("/", 1)
+            media_type = MediaType(media_type_str)
+            if media_type == MediaType.ALBUM:
+                for track in await self.mass.music.albums.tracks(
+                    item_id, provider_instance_id_or_domain
+                ):
+                    unwrapped_uris.append(track.uri)
+            elif media_type == MediaType.PLAYLIST:
+                for track in await self.tracks(item_id, provider_instance_id_or_domain):
+                    unwrapped_uris.append(track.uri)
+            elif media_type == MediaType.TRACK:
+                unwrapped_uris.append(uri)
+            else:
+                self.logger.warning(
+                    "Not adding %s to playlist %s - not a track", uri, playlist.name
+                )
+                continue
+
         # work out the track id's that need to be added
         # filter out duplicates and items that not exist on the provider.
         ids_to_add: set[str] = set()
-        for uri in uris:
+        for uri in unwrapped_uris:
             # skip if item already in the playlist
             if uri in cur_playlist_track_uris:
                 self.logger.info(
@@ -137,14 +173,6 @@ class PlaylistController(MediaControllerBase[Playlist]):
                     "Not adding %s to playlist %s - it already exists",
                     uri,
                     playlist.name,
-                )
-                continue
-
-            # skip non-track items
-            # TODO: revisit this once we support audiobooks and podcasts ?
-            if media_type != MediaType.TRACK:
-                self.logger.warning(
-                    "Not adding %s to playlist %s - not a track", uri, playlist.name
                 )
                 continue
 
@@ -291,6 +319,8 @@ class PlaylistController(MediaControllerBase[Playlist]):
                 "metadata": serialize_to_json(item.metadata),
                 "external_ids": serialize_to_json(item.external_ids),
                 "cache_checksum": item.cache_checksum,
+                "search_name": create_safe_string(item.name, True, True),
+                "search_sort_name": create_safe_string(item.sort_name, True, True),
             },
         )
         # update/set provider_mappings table
@@ -306,15 +336,15 @@ class PlaylistController(MediaControllerBase[Playlist]):
         cur_item = await self.get_library_item(db_id)
         metadata = update.metadata if overwrite else cur_item.metadata.update(update.metadata)
         cur_item.external_ids.update(update.external_ids)
+        name = update.name if overwrite else cur_item.name
+        sort_name = update.sort_name if overwrite else cur_item.sort_name or update.sort_name
         await self.mass.music.database.update(
             self.db_table,
             {"item_id": db_id},
             {
                 # always prefer name/owner from updated item here
-                "name": update.name,
-                "sort_name": update.sort_name
-                if (overwrite or update.name != cur_item.name)
-                else cur_item.sort_name,
+                "name": name,
+                "sort_name": sort_name,
                 "owner": update.owner or cur_item.owner,
                 "is_editable": update.is_editable,
                 "metadata": serialize_to_json(metadata),
@@ -322,6 +352,8 @@ class PlaylistController(MediaControllerBase[Playlist]):
                     update.external_ids if overwrite else cur_item.external_ids
                 ),
                 "cache_checksum": update.cache_checksum or cur_item.cache_checksum,
+                "search_name": create_safe_string(name, True, True),
+                "search_sort_name": create_safe_string(sort_name, True, True),
             },
         )
         # update/set provider_mappings table
@@ -347,7 +379,7 @@ class PlaylistController(MediaControllerBase[Playlist]):
         if not provider:
             return []
         # prefer cache items (if any)
-        cache_category = CacheCategory.MUSIC_PLAYLIST_TRACKS
+        cache_category = CACHE_CATEGORY_MUSIC_PLAYLIST_TRACKS
         cache_base_key = provider.lookup_key
         cache_key = f"{item_id}.{page}"
         if (
@@ -382,7 +414,7 @@ class PlaylistController(MediaControllerBase[Playlist]):
                 await self.mass.cache.set(
                     f"track.{item_id}",
                     item.to_dict(),
-                    category=CacheCategory.MUSIC_PROVIDER_ITEM,
+                    category=CACHE_CATEGORY_MUSIC_PROVIDER_ITEM,
                     base_key=provider.lookup_key,
                 )
         return items

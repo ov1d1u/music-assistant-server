@@ -33,6 +33,7 @@ from music_assistant_models.media_items import (
     AudioFormat,
     ItemMapping,
     MediaItemImage,
+    MediaItemType,
     Playlist,
     Podcast,
     PodcastEpisode,
@@ -606,7 +607,7 @@ class OpenSonicProvider(MusicProvider):
     async def get_podcast_episode(self, prov_episode_id: str) -> PodcastEpisode:
         """Get (full) podcast episode details by id."""
         podcast_id, _ = prov_episode_id.split(EP_CHAN_SEP)
-        for episode in await self.get_podcast_episodes(podcast_id):
+        async for episode in self.get_podcast_episodes(podcast_id):
             if episode.item_id == prov_episode_id:
                 return episode
         msg = f"Episode {prov_episode_id} not found"
@@ -615,20 +616,16 @@ class OpenSonicProvider(MusicProvider):
     async def get_podcast_episodes(
         self,
         prov_podcast_id: str,
-    ) -> list[PodcastEpisode]:
+    ) -> AsyncGenerator[PodcastEpisode, None]:
         """Get all Episodes for given podcast id."""
         if not self._enable_podcasts:
-            return []
-
+            return
         channels = await self._run_async(
             self._conn.getPodcasts, incEpisodes=True, pid=prov_podcast_id
         )
-
         channel = channels[0]
-        episodes = []
         for episode in channel.episodes:
-            episodes.append(self._parse_epsiode(episode, channel))
-        return episodes
+            yield self._parse_epsiode(episode, channel)
 
     async def get_podcast(self, prov_podcast_id: str) -> Podcast:
         """Get full Podcast details by id."""
@@ -794,9 +791,11 @@ class OpenSonicProvider(MusicProvider):
     async def on_played(
         self,
         media_type: MediaType,
-        item_id: str,
+        prov_item_id: str,
         fully_played: bool,
         position: int,
+        media_item: MediaItemType,
+        is_playing: bool = False,
     ) -> None:
         """
         Handle callback when a (playable) media item has been played.
@@ -807,9 +806,14 @@ class OpenSonicProvider(MusicProvider):
             - every 30s when a track is playing
 
         Fully played is True when the track has been played to the end.
+
         Position is the last known position of the track in seconds, to sync resume state.
         When fully_played is set to false and position is 0,
         the user marked the item as unplayed in the UI.
+
+        is_playing is True when the track is currently playing.
+
+        media_item is the full media item details of the played/playing track.
         """
         # Leave this function as the place where we will create a bookmark for podcasts when they
         # are stopped early and delete the bookmark when they are finished.

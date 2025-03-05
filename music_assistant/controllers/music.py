@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import shutil
+from collections.abc import Sequence
 from contextlib import suppress
 from itertools import zip_longest
 from math import inf
@@ -13,7 +14,6 @@ from typing import TYPE_CHECKING, Final, cast
 
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueType
 from music_assistant_models.enums import (
-    CacheCategory,
     ConfigEntryType,
     EventType,
     MediaType,
@@ -28,6 +28,7 @@ from music_assistant_models.errors import (
 )
 from music_assistant_models.helpers import get_global_cache_value
 from music_assistant_models.media_items import (
+    Artist,
     BrowseFolder,
     ItemMapping,
     MediaItemType,
@@ -35,8 +36,10 @@ from music_assistant_models.media_items import (
     SearchResults,
 )
 from music_assistant_models.provider import SyncTask
+from music_assistant_models.unique_list import UniqueList
 
 from music_assistant.constants import (
+    CACHE_CATEGORY_MUSIC_SEARCH,
     DB_TABLE_ALBUM_ARTISTS,
     DB_TABLE_ALBUM_TRACKS,
     DB_TABLE_ALBUMS,
@@ -54,6 +57,7 @@ from music_assistant.constants import (
     PROVIDERS_WITH_SHAREABLE_URLS,
 )
 from music_assistant.helpers.api import api_command
+from music_assistant.helpers.compare import create_safe_string
 from music_assistant.helpers.database import DatabaseConnection
 from music_assistant.helpers.datetime import utc_timestamp
 from music_assistant.helpers.json import json_loads, serialize_to_json
@@ -80,7 +84,7 @@ DEFAULT_SYNC_INTERVAL = 12 * 60  # default sync interval in minutes
 CONF_SYNC_INTERVAL = "sync_interval"
 CONF_DELETED_PROVIDERS = "deleted_providers"
 CONF_ADD_LIBRARY_ON_PLAY = "add_library_on_play"
-DB_SCHEMA_VERSION: Final[int] = 15
+DB_SCHEMA_VERSION: Final[int] = 16
 
 
 class MusicController(CoreController):
@@ -282,7 +286,7 @@ class MusicController(CoreController):
         )
         # return result from all providers while keeping index
         # so the result is sorted as each provider delivered
-        return SearchResults(
+        result = SearchResults(
             artists=[
                 item
                 for sublist in zip_longest(*[x.artists for x in results_per_provider])
@@ -327,6 +331,18 @@ class MusicController(CoreController):
             ][:limit],
         )
 
+        # the search results should already be sorted by relevance
+        # but we apply one extra round of sorting and that is to put exact name
+        # matches and library items first
+        result.artists = self._sort_search_result(search_query, result.artists)
+        result.albums = self._sort_search_result(search_query, result.albums)
+        result.tracks = self._sort_search_result(search_query, result.tracks)
+        result.playlists = self._sort_search_result(search_query, result.playlists)
+        result.radio = self._sort_search_result(search_query, result.radio)
+        result.audiobooks = self._sort_search_result(search_query, result.audiobooks)
+        result.podcasts = self._sort_search_result(search_query, result.podcasts)
+        return result
+
     async def search_provider(
         self,
         search_query: str,
@@ -353,7 +369,7 @@ class MusicController(CoreController):
 
         # prefer cache items (if any)
         media_types_str = ",".join(media_types)
-        cache_category = CacheCategory.MUSIC_SEARCH
+        cache_category = CACHE_CATEGORY_MUSIC_SEARCH
         cache_base_key = prov.lookup_key
         cache_key = f"{search_query}.{limit}.{media_types_str}"
 
@@ -806,9 +822,10 @@ class MusicController(CoreController):
     @api_command("music/mark_played")
     async def mark_item_played(
         self,
-        media_item: MediaItemTypeOrItemMapping,
+        media_item: MediaItemType,
         fully_played: bool = True,
         seconds_played: int | None = None,
+        is_playing: bool = False,
     ) -> None:
         """Mark item as played in playlog."""
         timestamp = utc_timestamp()
@@ -820,23 +837,24 @@ class MusicController(CoreController):
             # one-off items like TTS or some sound effect etc.
             return
 
-        # update generic playlog table
-        await self.database.insert(
-            DB_TABLE_PLAYLOG,
-            {
-                "item_id": media_item.item_id,
-                "provider": media_item.provider,
-                "media_type": media_item.media_type.value,
-                "name": media_item.name,
-                "image": serialize_to_json(media_item.image.to_dict())
-                if media_item.image
-                else None,
-                "fully_played": fully_played,
-                "seconds_played": seconds_played,
-                "timestamp": timestamp,
-            },
-            allow_replace=True,
-        )
+        # update generic playlog table (when not playing)
+        if not is_playing:
+            await self.database.insert(
+                DB_TABLE_PLAYLOG,
+                {
+                    "item_id": media_item.item_id,
+                    "provider": media_item.provider,
+                    "media_type": media_item.media_type.value,
+                    "name": media_item.name,
+                    "image": serialize_to_json(media_item.image.to_dict())
+                    if media_item.image
+                    else None,
+                    "fully_played": fully_played,
+                    "seconds_played": seconds_played,
+                    "timestamp": timestamp,
+                },
+                allow_replace=True,
+            )
 
         # forward to provider(s) to sync resume state (e.g. for audiobooks)
         for prov_mapping in media_item.provider_mappings:
@@ -844,14 +862,16 @@ class MusicController(CoreController):
                 self.mass.create_task(
                     music_prov.on_played(
                         media_type=media_item.media_type,
-                        item_id=prov_mapping.item_id,
+                        prov_item_id=prov_mapping.item_id,
                         fully_played=fully_played,
                         position=seconds_played,
+                        media_item=media_item,
+                        is_playing=is_playing,
                     )
                 )
 
         # also update playcount in library table (if fully played)
-        if not fully_played:
+        if not fully_played or is_playing:
             return
         if not (ctrl := self.get_controller(media_item.media_type)):
             # skip non media items (e.g. plugin source)
@@ -875,7 +895,7 @@ class MusicController(CoreController):
     @api_command("music/mark_unplayed")
     async def mark_item_unplayed(
         self,
-        media_item: MediaItemTypeOrItemMapping,
+        media_item: MediaItemType,
     ) -> None:
         """Mark item as unplayed in playlog."""
         # update generic playlog table
@@ -893,9 +913,10 @@ class MusicController(CoreController):
                 self.mass.create_task(
                     music_prov.on_played(
                         media_type=media_item.media_type,
-                        item_id=prov_mapping.item_id,
+                        prov_item_id=prov_mapping.item_id,
                         fully_played=False,
                         position=0,
+                        media_item=media_item,
                     )
                 )
         # also update playcount in library table
@@ -1328,6 +1349,40 @@ class MusicController(CoreController):
             await self.database.execute(f"DROP TABLE IF EXISTS {DB_TABLE_PLAYLOG}")
             await self.__create_database_tables()
 
+        if prev_version <= 15:
+            # add search_name and search_sort_name columns to all tables
+            # and populate them with the name and sort_name values
+            # this is to allow for local/case independent searches
+            for table in (
+                DB_TABLE_TRACKS,
+                DB_TABLE_ALBUMS,
+                DB_TABLE_ARTISTS,
+                DB_TABLE_RADIOS,
+                DB_TABLE_PLAYLISTS,
+                DB_TABLE_AUDIOBOOKS,
+                DB_TABLE_PODCASTS,
+            ):
+                try:
+                    await self.database.execute(
+                        f"ALTER TABLE {table} ADD COLUMN search_name TEXT DEFAULT '' NOT NULL"
+                    )
+                    await self.database.execute(
+                        f"ALTER TABLE {table} ADD COLUMN search_sort_name TEXT DEFAULT '' NOT NULL"
+                    )
+                except Exception as err:
+                    if "duplicate column" not in str(err):
+                        raise
+                # migrate all existing values
+                async for db_row in self.database.iter_items(table):
+                    await self.database.update(
+                        table,
+                        {"item_id": db_row["item_id"]},
+                        {
+                            "search_name": create_safe_string(db_row["name"], True, True),
+                            "search_sort_name": create_safe_string(db_row["sort_name"], True, True),
+                        },
+                    )
+
         # save changes
         await self.database.commit()
 
@@ -1379,7 +1434,9 @@ class MusicController(CoreController):
                     [play_count] INTEGER DEFAULT 0,
                     [last_played] INTEGER DEFAULT 0,
                     [timestamp_added] INTEGER DEFAULT (cast(strftime('%s','now') as int)),
-                    [timestamp_modified] INTEGER
+                    [timestamp_modified] INTEGER,
+                    [search_name] TEXT NOT NULL,
+                    [search_sort_name] TEXT NOT NULL
                 );"""
         )
         await self.database.execute(
@@ -1394,7 +1451,9 @@ class MusicController(CoreController):
             [play_count] INTEGER DEFAULT 0,
             [last_played] INTEGER DEFAULT 0,
             [timestamp_added] INTEGER DEFAULT (cast(strftime('%s','now') as int)),
-            [timestamp_modified] INTEGER
+            [timestamp_modified] INTEGER,
+            [search_name] TEXT NOT NULL,
+            [search_sort_name] TEXT NOT NULL
             );"""
         )
         await self.database.execute(
@@ -1411,7 +1470,9 @@ class MusicController(CoreController):
             [play_count] INTEGER DEFAULT 0,
             [last_played] INTEGER DEFAULT 0,
             [timestamp_added] INTEGER DEFAULT (cast(strftime('%s','now') as int)),
-            [timestamp_modified] INTEGER
+            [timestamp_modified] INTEGER,
+            [search_name] TEXT NOT NULL,
+            [search_sort_name] TEXT NOT NULL
             );"""
         )
         await self.database.execute(
@@ -1429,7 +1490,9 @@ class MusicController(CoreController):
             [play_count] INTEGER DEFAULT 0,
             [last_played] INTEGER DEFAULT 0,
             [timestamp_added] INTEGER DEFAULT (cast(strftime('%s','now') as int)),
-            [timestamp_modified] INTEGER
+            [timestamp_modified] INTEGER,
+            [search_name] TEXT NOT NULL,
+            [search_sort_name] TEXT NOT NULL
             );"""
         )
         await self.database.execute(
@@ -1444,7 +1507,9 @@ class MusicController(CoreController):
             [play_count] INTEGER DEFAULT 0,
             [last_played] INTEGER DEFAULT 0,
             [timestamp_added] INTEGER DEFAULT (cast(strftime('%s','now') as int)),
-            [timestamp_modified] INTEGER
+            [timestamp_modified] INTEGER,
+            [search_name] TEXT NOT NULL,
+            [search_sort_name] TEXT NOT NULL
             );"""
         )
         await self.database.execute(
@@ -1464,7 +1529,9 @@ class MusicController(CoreController):
             [play_count] INTEGER DEFAULT 0,
             [last_played] INTEGER DEFAULT 0,
             [timestamp_added] INTEGER DEFAULT (cast(strftime('%s','now') as int)),
-            [timestamp_modified] INTEGER
+            [timestamp_modified] INTEGER,
+            [search_name] TEXT NOT NULL,
+            [search_sort_name] TEXT NOT NULL
             );"""
         )
         await self.database.execute(
@@ -1482,7 +1549,9 @@ class MusicController(CoreController):
             [play_count] INTEGER DEFAULT 0,
             [last_played] INTEGER DEFAULT 0,
             [timestamp_added] INTEGER DEFAULT (cast(strftime('%s','now') as int)),
-            [timestamp_modified] INTEGER
+            [timestamp_modified] INTEGER,
+            [search_name] TEXT NOT NULL,
+            [search_sort_name] TEXT NOT NULL
             );"""
         )
         await self.database.execute(
@@ -1564,19 +1633,18 @@ class MusicController(CoreController):
             await self.database.execute(
                 f"CREATE INDEX IF NOT EXISTS {db_table}_name_idx on {db_table}(name);"
             )
-            # index on name (without case sensitivity)
+            # index on search_name (=lowercase name without diacritics)
             await self.database.execute(
-                f"CREATE INDEX IF NOT EXISTS {db_table}_name_nocase_idx "
-                f"ON {db_table}(name COLLATE NOCASE);"
+                f"CREATE INDEX IF NOT EXISTS {db_table}_name_nocase_idx ON {db_table}(search_name);"
             )
             # index on sort_name
             await self.database.execute(
                 f"CREATE INDEX IF NOT EXISTS {db_table}_sort_name_idx on {db_table}(sort_name);"
             )
-            # index on sort_name (without case sensitivity)
+            # index on search_sort_name (=lowercase sort_name without diacritics)
             await self.database.execute(
-                f"CREATE INDEX IF NOT EXISTS {db_table}_sort_name_nocase_idx "
-                f"ON {db_table}(sort_name COLLATE NOCASE);"
+                f"CREATE INDEX IF NOT EXISTS {db_table}_search_sort_name_idx "
+                f"ON {db_table}(search_sort_name);"
             )
             # index on external_ids
             await self.database.execute(
@@ -1670,3 +1738,43 @@ class MusicController(CoreController):
                 """
             )
         await self.database.commit()
+
+    def _sort_search_result(
+        self,
+        search_query: str,
+        items: Sequence[MediaItemTypeOrItemMapping],
+    ) -> UniqueList[MediaItemTypeOrItemMapping]:
+        """Sort search results on priority/preference."""
+        scored_items: list[tuple[int, MediaItemTypeOrItemMapping]] = []
+        # search results are already sorted by (streaming) providers on relevance
+        # but we prefer exact name matches and library items so we simply put those
+        # on top of the list.
+        safe_title_str = create_safe_string(search_query)
+        if " - " in search_query:
+            artist, title_alt = search_query.split(" - ", 1)
+            safe_title_alt = create_safe_string(title_alt)
+            safe_artist_str = create_safe_string(artist)
+        else:
+            safe_artist_str = None
+            safe_title_alt = None
+        for item in items:
+            score = 0
+            if create_safe_string(item.name) not in (safe_title_str, safe_title_alt):
+                # literal name match is mandatory to get a score at all
+                continue
+            # bonus point if artist provided and exact match
+            if safe_artist_str:
+                artist: Artist | ItemMapping
+                for artist in getattr(item, "artists", []):
+                    if create_safe_string(artist.name) == safe_artist_str:
+                        score += 1
+            # bonus point for library items
+            if item.provider == "library":
+                score += 1
+            scored_items.append((score, item))
+        scored_items.sort(key=lambda x: x[0], reverse=True)
+        # combine it all with uniquelist, so this will deduplicated by default
+        # note that streaming provider results are already (most likely) sorted on relevance
+        # so we add all remaining items in their original order. We just prioritize
+        # exact name matches and library items.
+        return UniqueList([*[x[1] for x in scored_items], *items])

@@ -22,7 +22,6 @@ from music_assistant_models.enums import (
     PlayerState,
     PlayerType,
     ProviderFeature,
-    StreamType,
 )
 from music_assistant_models.errors import SetupFailedError
 from music_assistant_models.media_items import AudioFormat
@@ -36,6 +35,7 @@ from music_assistant.constants import (
     CONF_ENTRY_CROSSFADE,
     CONF_ENTRY_CROSSFADE_DURATION,
     CONF_ENTRY_FLOW_MODE_ENFORCED,
+    CONF_ENTRY_OUTPUT_CODEC_HIDDEN,
     DEFAULT_PCM_FORMAT,
     create_sample_rates_config_entry,
 )
@@ -43,7 +43,6 @@ from music_assistant.helpers.audio import FFMpeg, get_ffmpeg_stream, get_player_
 from music_assistant.helpers.process import AsyncProcess, check_output
 from music_assistant.helpers.util import get_ip_pton
 from music_assistant.models.player_provider import PlayerProvider
-from music_assistant.models.plugin import PluginProvider
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ProviderConfig
@@ -76,7 +75,9 @@ CONF_HELP_LINK = (
 )
 
 # airplay has fixed sample rate/bit depth so make this config entry static and hidden
-CONF_ENTRY_SAMPLE_RATES_SNAPCAST = create_sample_rates_config_entry(48000, 16, 48000, 16, True)
+CONF_ENTRY_SAMPLE_RATES_SNAPCAST = create_sample_rates_config_entry(
+    supported_sample_rates=[48000], supported_bit_depths=[16], hidden=True
+)
 
 DEFAULT_SNAPSERVER_IP = "127.0.0.1"
 DEFAULT_SNAPSERVER_PORT = 1705
@@ -369,7 +370,7 @@ class SnapCastProvider(PlayerProvider):
             )
             player = Player(
                 player_id=player_id,
-                provider=self.lookup_key,
+                provider=self.instance_id,
                 type=PlayerType.PLAYER,
                 name=snap_client.friendly_name,
                 available=snap_client.connected,
@@ -384,7 +385,7 @@ class SnapCastProvider(PlayerProvider):
                     PlayerFeature.VOLUME_MUTE,
                 },
                 synced_to=self._synced_to(player_id),
-                can_group_with={self.lookup_key},
+                can_group_with={self.instance_id},
             )
         asyncio.run_coroutine_threadsafe(
             self.mass.players.register_or_update(player), loop=self.mass.loop
@@ -421,6 +422,7 @@ class SnapCastProvider(PlayerProvider):
             CONF_ENTRY_CROSSFADE,
             CONF_ENTRY_CROSSFADE_DURATION,
             CONF_ENTRY_SAMPLE_RATES_SNAPCAST,
+            CONF_ENTRY_OUTPUT_CODEC_HIDDEN,
         )
 
     async def cmd_volume_set(self, player_id: str, volume_level: int) -> None:
@@ -515,16 +517,11 @@ class SnapCastProvider(PlayerProvider):
             )
         elif media.media_type == MediaType.PLUGIN_SOURCE:
             # special case: plugin source stream
-            # consume the stream directly, so we can skip one step in between
-            assert media.custom_data is not None  # for type checking
-            provider = cast(PluginProvider, self.mass.get_provider(media.custom_data["provider"]))
-            plugin_source = provider.get_source()
-            assert plugin_source.audio_format is not None  # for type checking
-            input_format = plugin_source.audio_format
-            audio_source = (
-                provider.get_audio_stream(player_id)
-                if plugin_source.stream_type == StreamType.CUSTOM
-                else plugin_source.path
+            input_format = DEFAULT_SNAPCAST_FORMAT
+            audio_source = self.mass.streams.get_plugin_source_stream(
+                plugin_source_id=media.custom_data["provider"],
+                output_format=DEFAULT_SNAPCAST_FORMAT,
+                player_id=player_id,
             )
         elif media.queue_id.startswith("ugp_"):
             # special case: UGP stream

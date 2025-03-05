@@ -73,7 +73,7 @@ def parse_podcast(
         mass_podcast.metadata.genres = set(abs_podcast.media.metadata.genres)
     mass_podcast.metadata.release_date = abs_podcast.media.metadata.release_date
 
-    if isinstance(abs_podcast, AbsLibraryItemExpandedPodcast):
+    if isinstance(abs_podcast, AbsLibraryItemExpandedPodcast | AbsLibraryItemPodcast):
         mass_podcast.total_episodes = len(abs_podcast.media.episodes)
     elif isinstance(abs_podcast, AbsLibraryItemMinifiedPodcast):
         mass_podcast.total_episodes = abs_podcast.media.num_episodes
@@ -141,7 +141,7 @@ def parse_podcast_episode(
             [MediaItemImage(type=ImageType.THUMB, path=url_cover, provider=lookup_key)]
         )
 
-    if media_progress is not None:
+    if media_progress is not None and media_progress.current_time is not None:
         mass_episode.resume_position_ms = int(media_progress.current_time * 1000)
         mass_episode.fully_played = media_progress.is_finished
 
@@ -217,7 +217,7 @@ def parse_audiobook(
         mass_audiobook.authors.set([abs_audiobook.media.metadata.author_name])
         mass_audiobook.narrators.set([abs_audiobook.media.metadata.narrator_name])
 
-    if media_progress is not None:
+    if media_progress is not None and media_progress.current_time is not None:
         mass_audiobook.resume_position_ms = int(media_progress.current_time * 1000)
         mass_audiobook.fully_played = media_progress.is_finished
 

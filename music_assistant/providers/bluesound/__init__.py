@@ -16,9 +16,9 @@ from zeroconf import ServiceStateChange
 from music_assistant.constants import (
     CONF_ENTRY_CROSSFADE,
     CONF_ENTRY_ENABLE_ICY_METADATA,
-    CONF_ENTRY_ENFORCE_MP3,
     CONF_ENTRY_FLOW_MODE_ENFORCED,
     CONF_ENTRY_HTTP_PROFILE_FORCED_2,
+    CONF_ENTRY_OUTPUT_CODEC,
     VERBOSE_LOG_LEVEL,
 )
 from music_assistant.helpers.util import (
@@ -277,7 +277,7 @@ class BluesoundPlayerProvider(PlayerProvider):
 
         bluos_player.mass_player = mass_player = Player(
             player_id=self.player_id,
-            provider=self.lookup_key,
+            provider=self.instance_id,
             type=PlayerType.PLAYER,
             name=name,
             available=True,
@@ -294,7 +294,7 @@ class BluesoundPlayerProvider(PlayerProvider):
             },
             needs_poll=True,
             poll_interval=30,
-            can_group_with={self.lookup_key},
+            can_group_with={self.instance_id},
         )
         await self.mass.players.register(mass_player)
 
@@ -315,7 +315,7 @@ class BluesoundPlayerProvider(PlayerProvider):
             *base_entries,
             CONF_ENTRY_HTTP_PROFILE_FORCED_2,
             CONF_ENTRY_CROSSFADE,
-            CONF_ENTRY_ENFORCE_MP3,
+            CONF_ENTRY_OUTPUT_CODEC,
             CONF_ENTRY_FLOW_MODE_ENFORCED,
             CONF_ENTRY_ENABLE_ICY_METADATA,
         )

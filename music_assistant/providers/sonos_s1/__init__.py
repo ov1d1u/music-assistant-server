@@ -32,11 +32,10 @@ from soco.discovery import discover, scan_network
 
 from music_assistant.constants import (
     CONF_CROSSFADE,
-    CONF_ENFORCE_MP3,
     CONF_ENTRY_CROSSFADE,
-    CONF_ENTRY_ENFORCE_MP3,
     CONF_ENTRY_FLOW_MODE_HIDDEN_DISABLED,
     CONF_ENTRY_HTTP_PROFILE_FORCED_1,
+    CONF_ENTRY_OUTPUT_CODEC,
     VERBOSE_LOG_LEVEL,
     create_sample_rates_config_entry,
 )
@@ -66,7 +65,9 @@ CONF_HOUSEHOLD_ID = "household_id"
 SUBSCRIPTION_TIMEOUT = 1200
 ZGS_SUBSCRIPTION_TIMEOUT = 2
 
-CONF_ENTRY_SAMPLE_RATES = create_sample_rates_config_entry(48000, 16, 48000, 16, True)
+CONF_ENTRY_SAMPLE_RATES = create_sample_rates_config_entry(
+    max_sample_rate=48000, max_bit_depth=16, hidden=True
+)
 
 
 async def setup(
@@ -182,14 +183,14 @@ class SonosPlayerProvider(PlayerProvider):
             return (
                 *base_entries,
                 CONF_ENTRY_CROSSFADE,
-                CONF_ENTRY_ENFORCE_MP3,
+                CONF_ENTRY_OUTPUT_CODEC,
                 CONF_ENTRY_FLOW_MODE_HIDDEN_DISABLED,
             )
         return (
             *base_entries,
             CONF_ENTRY_CROSSFADE,
             CONF_ENTRY_SAMPLE_RATES,
-            CONF_ENTRY_ENFORCE_MP3,
+            CONF_ENTRY_OUTPUT_CODEC,
             CONF_ENTRY_FLOW_MODE_HIDDEN_DISABLED,
             CONF_ENTRY_HTTP_PROFILE_FORCED_1,
         )
@@ -298,8 +299,6 @@ class SonosPlayerProvider(PlayerProvider):
                 "accept play_media command, it is synced to another player."
             )
             raise PlayerCommandFailed(msg)
-        if await self.mass.config.get_player_config_value(player_id, CONF_ENFORCE_MP3):
-            media.uri = media.uri.replace(".flac", ".mp3")
         didl_metadata = create_didl_metadata(media)
         await asyncio.to_thread(sonos_player.soco.play_uri, media.uri, meta=didl_metadata)
         self.mass.call_later(2, sonos_player.poll_speaker)
@@ -308,8 +307,6 @@ class SonosPlayerProvider(PlayerProvider):
     async def enqueue_next_media(self, player_id: str, media: PlayerMedia) -> None:
         """Handle enqueuing of the next queue item on the player."""
         sonos_player = self.sonosplayers[player_id]
-        if await self.mass.config.get_player_config_value(player_id, CONF_ENFORCE_MP3):
-            media.uri = media.uri.replace(".flac", ".mp3")
         didl_metadata = create_didl_metadata(media)
         # set crossfade according to player setting
         crossfade = bool(await self.mass.config.get_player_config_value(player_id, CONF_CROSSFADE))
@@ -432,7 +429,7 @@ class SonosPlayerProvider(PlayerProvider):
         if not (mass_player := self.mass.players.get(soco.uid)):
             mass_player = Player(
                 player_id=soco.uid,
-                provider=self.lookup_key,
+                provider=self.instance_id,
                 type=PlayerType.PLAYER,
                 name=soco.player_name,
                 available=True,
@@ -444,7 +441,7 @@ class SonosPlayerProvider(PlayerProvider):
                 ),
                 needs_poll=True,
                 poll_interval=30,
-                can_group_with={self.lookup_key},
+                can_group_with={self.instance_id},
             )
         self.sonosplayers[player_id] = sonos_player = SonosPlayer(
             self,

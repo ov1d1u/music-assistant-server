@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
+from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any
 
 from music_assistant_models.enums import MediaType, ProviderFeature
@@ -14,6 +14,7 @@ from music_assistant.controllers.media.base import MediaControllerBase
 from music_assistant.helpers.compare import (
     compare_media_item,
     compare_podcast,
+    create_safe_string,
     loose_compare_strings,
 )
 from music_assistant.helpers.json import serialize_to_json
@@ -99,7 +100,7 @@ class PodcastsController(MediaControllerBase[Podcast]):
         self,
         item_id: str,
         provider_instance_id_or_domain: str,
-    ) -> UniqueList[PodcastEpisode]:
+    ) -> AsyncGenerator[PodcastEpisode, None]:
         """Return podcast episodes for the given provider podcast id."""
         # always check if we have a library item for this podcast
         if provider_instance_id_or_domain == "library":
@@ -112,10 +113,10 @@ class PodcastsController(MediaControllerBase[Podcast]):
                 break
         # podcast episodes are not stored in the db/library
         # so we always need to fetch them from the provider
-        episodes = await self._get_provider_podcast_episodes(
+        async for episode in self._get_provider_podcast_episodes(
             item_id, provider_instance_id_or_domain
-        )
-        return sorted(episodes, key=lambda x: x.position)
+        ):
+            yield episode
 
     async def episode(
         self,
@@ -168,6 +169,8 @@ class PodcastsController(MediaControllerBase[Podcast]):
                 "external_ids": serialize_to_json(item.external_ids),
                 "publisher": item.publisher,
                 "total_episodes": item.total_episodes,
+                "search_name": create_safe_string(item.name, True, True),
+                "search_sort_name": create_safe_string(item.sort_name, True, True),
             },
         )
         # update/set provider_mappings table
@@ -188,14 +191,14 @@ class PodcastsController(MediaControllerBase[Podcast]):
             if overwrite
             else {*cur_item.provider_mappings, *update.provider_mappings}
         )
+        name = update.name if overwrite else cur_item.name
+        sort_name = update.sort_name if overwrite else cur_item.sort_name or update.sort_name
         await self.mass.music.database.update(
             self.db_table,
             {"item_id": db_id},
             {
-                "name": update.name if overwrite else cur_item.name,
-                "sort_name": update.sort_name
-                if overwrite
-                else cur_item.sort_name or update.sort_name,
+                "name": name,
+                "sort_name": sort_name,
                 "version": update.version if overwrite else cur_item.version or update.version,
                 "metadata": serialize_to_json(metadata),
                 "external_ids": serialize_to_json(
@@ -203,6 +206,8 @@ class PodcastsController(MediaControllerBase[Podcast]):
                 ),
                 "publisher": cur_item.publisher or update.publisher,
                 "total_episodes": cur_item.total_episodes or update.total_episodes,
+                "search_name": create_safe_string(name, True, True),
+                "search_sort_name": create_safe_string(sort_name, True, True),
             },
         )
         # update/set provider_mappings table
@@ -211,15 +216,11 @@ class PodcastsController(MediaControllerBase[Podcast]):
 
     async def _get_provider_podcast_episodes(
         self, item_id: str, provider_instance_id_or_domain: str
-    ) -> list[PodcastEpisode]:
+    ) -> AsyncGenerator[PodcastEpisode, None]:
         """Return podcast episodes for the given provider podcast id."""
         prov: MusicProvider = self.mass.get_provider(provider_instance_id_or_domain)
         if prov is None:
-            return []
-        # grab the episodes from the provider
-        # note that we do not cache any of this because its
-        # always a rather small list and we want fresh resume info
-        items = await prov.get_podcast_episodes(item_id)
+            return
 
         async def set_resume_position(episode: PodcastEpisode) -> None:
             if episode.fully_played is not None or episode.resume_position_ms:
@@ -242,8 +243,12 @@ class PodcastsController(MediaControllerBase[Podcast]):
             if resume_info_db_row["fully_played"] is not None:
                 episode.fully_played = resume_info_db_row["fully_played"]
 
-        await asyncio.gather(*[set_resume_position(x) for x in items])
-        return items
+        # grab the episodes from the provider
+        # note that we do not cache any of this because its
+        # always a rather small list and we want fresh resume info
+        async for item in prov.get_podcast_episodes(item_id):
+            await set_resume_position(item)
+            yield item
 
     async def radio_mode_base_tracks(
         self,

@@ -42,15 +42,14 @@ from music_assistant_models.player import DeviceInfo, Player, PlayerMedia
 from music_assistant.constants import (
     CONF_CROSSFADE,
     CONF_CROSSFADE_DURATION,
-    CONF_ENFORCE_MP3,
     CONF_ENTRY_CROSSFADE,
     CONF_ENTRY_CROSSFADE_DURATION,
     CONF_ENTRY_DEPRECATED_EQ_BASS,
     CONF_ENTRY_DEPRECATED_EQ_MID,
     CONF_ENTRY_DEPRECATED_EQ_TREBLE,
-    CONF_ENTRY_ENFORCE_MP3,
     CONF_ENTRY_HTTP_PROFILE_FORCED_2,
     CONF_ENTRY_OUTPUT_CHANNELS,
+    CONF_ENTRY_OUTPUT_CODEC,
     CONF_ENTRY_SYNC_ADJUST,
     CONF_PORT,
     CONF_SYNC_ADJUST,
@@ -266,10 +265,18 @@ class SlimprotoProvider(PlayerProvider):
         self.mass.streams.register_dynamic_route(
             "/slimproto/multi", self._serve_multi_client_stream
         )
+        # it seems that WiiM devices do not use the json rpc port that is broadcasted
+        # in the discovery info but instead they just assume that the jsonrpc endpoint
+        # lives on the same server as stream URL. So we need to provide a jsonrpc.js
+        # endpoint that just redirects to the jsonrpc handler within the slimproto package.
+        self.mass.streams.register_dynamic_route(
+            "/jsonrpc.js", self.slimproto.cli._handle_jsonrpc_client
+        )
 
     async def unload(self, is_removed: bool = False) -> None:
         """Handle close/cleanup of the provider."""
         self.mass.streams.unregister_dynamic_route("/slimproto/multi")
+        self.mass.streams.unregister_dynamic_route("/jsonrpc.js")
         await self.slimproto.stop()
 
     async def get_player_config_entries(self, player_id: str) -> tuple[ConfigEntry]:
@@ -311,12 +318,14 @@ class SlimprotoProvider(PlayerProvider):
                 CONF_ENTRY_DEPRECATED_EQ_TREBLE,
                 CONF_ENTRY_OUTPUT_CHANNELS,
                 CONF_ENTRY_CROSSFADE_DURATION,
-                CONF_ENTRY_ENFORCE_MP3,
+                CONF_ENTRY_OUTPUT_CODEC,
                 CONF_ENTRY_SYNC_ADJUST,
                 CONF_ENTRY_DISPLAY,
                 CONF_ENTRY_VISUALIZATION,
                 CONF_ENTRY_HTTP_PROFILE_FORCED_2,
-                create_sample_rates_config_entry(max_sample_rate, 24, 48000, 24),
+                create_sample_rates_config_entry(
+                    max_sample_rate=max_sample_rate, max_bit_depth=24, safe_max_bit_depth=24
+                ),
             )
         )
 
@@ -380,9 +389,11 @@ class SlimprotoProvider(PlayerProvider):
         elif media.media_type == MediaType.PLUGIN_SOURCE:
             # special case: plugin source stream
             audio_source = self.mass.streams.get_plugin_source_stream(
-                plugin_source_id=media.custom_data["provider"],
+                plugin_source_id=media.custom_data["source_id"],
                 output_format=master_audio_format,
-                player_id=player_id,
+                # need to pass player_id from the PlayerMedia object
+                # because this could have been a group
+                player_id=media.custom_data["player_id"],
             )
         elif media.queue_id.startswith("ugp_"):
             # special case: UGP stream
@@ -423,10 +434,6 @@ class SlimprotoProvider(PlayerProvider):
         async with TaskManager(self.mass) as tg:
             for slimplayer in self._get_sync_clients(player_id):
                 url = f"{base_url}&child_player_id={slimplayer.player_id}"
-                if self.mass.config.get_raw_player_config_value(
-                    slimplayer.player_id, CONF_ENFORCE_MP3, False
-                ):
-                    url = url.replace("flac", "mp3")
                 stream.expected_clients += 1
                 tg.create_task(
                     self._handle_play_url(
@@ -442,15 +449,9 @@ class SlimprotoProvider(PlayerProvider):
         """Handle enqueuing of the next queue item on the player."""
         if not (slimplayer := self.slimproto.get_player(player_id)):
             return
-        url = media.uri
-        if self.mass.config.get_raw_player_config_value(
-            slimplayer.player_id, CONF_ENFORCE_MP3, False
-        ):
-            url = url.replace("flac", "mp3")
-
         await self._handle_play_url(
             slimplayer,
-            url=url,
+            url=media.uri,
             media=media,
             enqueue=True,
             send_flush=False,
@@ -485,9 +486,9 @@ class SlimprotoProvider(PlayerProvider):
             "queue_id": media.queue_id,
             "queue_item_id": media.queue_item_id,
         }
-        queue = self.mass.player_queues.get(media.queue_id or player_id)
-        slimplayer.extra_data["playlist repeat"] = REPEATMODE_MAP[queue.repeat_mode]
-        slimplayer.extra_data["playlist shuffle"] = int(queue.shuffle_enabled)
+        if queue := self.mass.player_queues.get(media.queue_id):
+            slimplayer.extra_data["playlist repeat"] = REPEATMODE_MAP[queue.repeat_mode]
+            slimplayer.extra_data["playlist shuffle"] = int(queue.shuffle_enabled)
         await slimplayer.play_url(
             url=url,
             mime_type=f"audio/{url.split('.')[-1].split('?')[0]}",
@@ -505,7 +506,7 @@ class SlimprotoProvider(PlayerProvider):
         # immediately set this track as the next
         # this prevents race conditions with super short audio clips (on single repeat)
         # https://github.com/music-assistant/hass-music-assistant/issues/2059
-        if queue.repeat_mode == RepeatMode.ONE:
+        if queue and queue.repeat_mode == RepeatMode.ONE:
             self.mass.call_later(
                 0.2,
                 slimplayer.play_url(
@@ -646,7 +647,7 @@ class SlimprotoProvider(PlayerProvider):
             # player does not yet exist, create it
             player = Player(
                 player_id=player_id,
-                provider=self.lookup_key,
+                provider=self.instance_id,
                 type=PlayerType.PLAYER,
                 name=slimplayer.name,
                 available=True,
@@ -665,7 +666,7 @@ class SlimprotoProvider(PlayerProvider):
                     PlayerFeature.VOLUME_MUTE,
                     PlayerFeature.ENQUEUE,
                 },
-                can_group_with={self.lookup_key},
+                can_group_with={self.instance_id},
             )
             await self.mass.players.register_or_update(player)
 

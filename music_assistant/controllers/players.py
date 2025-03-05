@@ -39,6 +39,8 @@ from music_assistant_models.player import Player, PlayerMedia
 from music_assistant_models.player_control import PlayerControl  # noqa: TC002
 
 from music_assistant.constants import (
+    CACHE_CATEGORY_PLAYERS,
+    CACHE_KEY_PLAYER_POWER,
     CONF_AUTO_PLAY,
     CONF_ENTRY_ANNOUNCE_VOLUME,
     CONF_ENTRY_ANNOUNCE_VOLUME_MAX,
@@ -397,7 +399,11 @@ class PlayerController(CoreController):
             async with self._player_throttlers[player_id]:
                 await player_provider.cmd_power(player_id, powered)
         elif player.power_control == PLAYER_CONTROL_FAKE:
-            # user wants to use fake power control - so we only (optimistically) update the state
+            # user wants to use fake power control - so we (optimistically) update the state
+            # and store the state in the cache
+            await self.mass.cache.set(
+                player_id, powered, category=CACHE_CATEGORY_PLAYERS, base_key=CACHE_KEY_PLAYER_POWER
+            )
             # short sleep: allow the stop command to process and prevent race conditions
             await asyncio.sleep(0.2)
         else:
@@ -722,12 +728,14 @@ class PlayerController(CoreController):
         # check if player is already playing and source is different
         # in that case we need to stop the player first
         prev_source = player.active_source
-        if prev_source and source != prev_source and player.state != PlayerState.IDLE:
-            await self.cmd_stop(player_id)
-            await asyncio.sleep(0.5)  # small delay to allow stop to process
+        if prev_source and source != prev_source:
+            if player.state != PlayerState.IDLE:
+                await self.cmd_stop(player_id)
+                await asyncio.sleep(0.5)  # small delay to allow stop to process
             player.active_source = None
+            player.current_media = None
         # check if source is a pluginsource
-        # in that case the source id is the lookup_key of the plugin provider
+        # in that case the source id is the instance_id of the plugin provider
         if plugin_prov := self.mass.get_provider(source):
             await self._handle_select_plugin_source(player, plugin_prov)
             return
@@ -735,6 +743,7 @@ class PlayerController(CoreController):
         # this can be used to restore the queue after a source switch
         if mass_queue := self.mass.player_queues.get(source):
             player.active_source = mass_queue.queue_id
+            self.update(player_id)
             return
         # basic check if player supports source selection
         if PlayerFeature.SELECT_SOURCE not in player.supported_features:
@@ -930,9 +939,9 @@ class PlayerController(CoreController):
             msg = f"Player {player_id} is already registered"
             raise AlreadyRegisteredError(msg)
 
-        # make sure that the player's provider is set to the lookup key (=instance id)
+        # make sure that the player's provider is set to the instance_id
         prov = self.mass.get_provider(player.provider)
-        if not prov or prov.lookup_key != player.provider:
+        if not prov or prov.instance_id != player.provider:
             raise RuntimeError(f"Invalid provider ID given: {player.provider}")
 
         # make sure a default config exists
@@ -956,7 +965,7 @@ class PlayerController(CoreController):
 
         # ensure initial player state gets populated with values from config
         player_config = await self.mass.config.get_player_config(player_id)
-        self._set_player_state_from_config(player, player_config)
+        await self._set_player_state_from_config(player, player_config)
 
         self.logger.info(
             "Player registered: %s/%s",
@@ -1016,7 +1025,7 @@ class PlayerController(CoreController):
         if player.power_control == PLAYER_CONTROL_NONE:
             player.powered = None
         elif player.power_control == PLAYER_CONTROL_FAKE:
-            player.powered = True if player.powered is None else player.powered
+            player.powered = False if player.powered is None else player.powered
         elif player.power_control != PLAYER_CONTROL_NATIVE:
             if player_control := self._controls.get(player.power_control):
                 player.powered = player_control.power_state
@@ -1154,9 +1163,9 @@ class PlayerController(CoreController):
             msg = f"PlayerControl {control_id} is already registered"
             raise AlreadyRegisteredError(msg)
 
-        # make sure that the playercontrol's provider is set to the lookup_key
+        # make sure that the playercontrol's provider is set to the instance_id
         prov = self.mass.get_provider(player_control.provider)
-        if not prov or prov.lookup_key != player_control.provider:
+        if not prov or prov.instance_id != player_control.provider:
             raise RuntimeError(f"Invalid provider ID given: {player_control.provider}")
 
         self._controls[control_id] = player_control
@@ -1315,7 +1324,7 @@ class PlayerController(CoreController):
         if not (player := self.get(config.player_id)):
             return
         # ensure player state gets updated with any updated config
-        self._set_player_state_from_config(player, config)
+        await self._set_player_state_from_config(player, config)
         resume_queue: PlayerQueue | None = self.mass.player_queues.get(player.active_source)
         # signal player provider that the config changed
         if player_provider := self.mass.get_provider(config.provider):
@@ -1401,8 +1410,9 @@ class PlayerController(CoreController):
             return self._get_active_source(group_player)
         # if player has plugin source active return that
         for plugin_source in self._get_plugin_sources():
-            if player.active_source == plugin_source.id or (
-                player.current_media and plugin_source.id == player.current_media.queue_id
+            if (
+                player.active_source == plugin_source.id
+                or plugin_source.in_use_by == player.player_id
             ):
                 # copy/set current media if available
                 if plugin_source.metadata:
@@ -1459,16 +1469,23 @@ class PlayerController(CoreController):
             if player.player_id in group_player.group_childs:
                 group_player.group_childs.remove(player.player_id)
 
-    def _set_player_state_from_config(self, player: Player, config: PlayerConfig) -> None:
+    async def _set_player_state_from_config(self, player: Player, config: PlayerConfig) -> None:
         """Set player state from config."""
         player.display_name = config.name or player.name or config.default_name or player.player_id
         player.hidden = config.get_value(CONF_HIDE_PLAYER)
         player.icon = config.get_value(CONF_ENTRY_PLAYER_ICON.key)
         player.power_control = config.get_value(CONF_POWER_CONTROL)
+        if player.power_control == PLAYER_CONTROL_FAKE:
+            player.powered = await self.mass.cache.get(
+                player.player_id,
+                default=False,
+                category=CACHE_CATEGORY_PLAYERS,
+                base_key=CACHE_KEY_PLAYER_POWER,
+            )
         player.volume_control = config.get_value(CONF_VOLUME_CONTROL)
         player.mute_control = config.get_value(CONF_MUTE_CONTROL)
 
-    async def _play_announcement(
+    async def _play_announcement(  # noqa: PLR0915
         self,
         player: Player,
         announcement: PlayerMedia,
@@ -1535,7 +1552,9 @@ class PlayerController(CoreController):
                         volume_player.display_name,
                     )
                     tg.create_task(self.cmd_stop(volume_player.player_id))
-                prev_volume = volume_player.volume_level
+                if volume_player.volume_control == PLAYER_CONTROL_NONE:
+                    continue
+                prev_volume = volume_player.volume_level or 0
                 announcement_volume = self.get_announcement_volume(volume_player_id, volume_level)
                 temp_volume = announcement_volume or player.volume_level
                 if temp_volume != prev_volume:
@@ -1612,7 +1631,6 @@ class PlayerController(CoreController):
                     except PlayerUnavailableError:
                         player.available = False
                         player.state = PlayerState.IDLE
-                        player.powered = None
                     except Exception as err:
                         self.logger.warning(
                             "Error while requesting latest state from player %s: %s",
@@ -1630,21 +1648,20 @@ class PlayerController(CoreController):
     ) -> None:
         """Handle playback/select of given plugin source on player."""
         plugin_source = plugin_prov.get_source()
-        if plugin_prov.in_use_by and plugin_prov.in_use_by != player.player_id:
-            raise PlayerCommandFailed(
-                f"Source {plugin_source.name} is already in use by another player"
-            )
         player.active_source = plugin_source.id
-        stream_url = self.mass.streams.get_plugin_source_url(plugin_source.id, player.player_id)
+        stream_url = await self.mass.streams.get_plugin_source_url(
+            plugin_source.id, player.player_id
+        )
         await self.play_media(
             player_id=player.player_id,
             media=PlayerMedia(
                 uri=stream_url,
                 media_type=MediaType.PLUGIN_SOURCE,
                 title=plugin_source.name,
-                queue_id=plugin_source.id,
                 custom_data={
-                    "provider": plugin_source.id,
+                    "provider": plugin_prov.instance_id,
+                    "source_id": plugin_source.id,
+                    "player_id": player.player_id,
                     "audio_format": plugin_source.audio_format,
                 },
             ),
@@ -1664,9 +1681,9 @@ class PlayerController(CoreController):
         for plugin_prov in self.mass.get_providers(ProviderType.PLUGIN):
             if ProviderFeature.AUDIO_SOURCE not in plugin_prov.supported_features:
                 continue
-            if plugin_prov.in_use_by and plugin_prov.in_use_by != player.player_id:
-                continue
             plugin_source = plugin_prov.get_source()
+            if plugin_source.in_use_by and plugin_source.in_use_by != player.player_id:
+                continue
             if plugin_source.id in player_source_ids:
                 continue
             player.source_list.append(plugin_source)

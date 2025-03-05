@@ -12,7 +12,6 @@ import aiofiles
 import shortuuid
 from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import (
-    CacheCategory,
     ConfigEntryType,
     ContentType,
     ImageType,
@@ -39,7 +38,7 @@ from music_assistant_models.media_items import (
 )
 from music_assistant_models.streamdetails import StreamDetails
 
-from music_assistant.constants import MASS_LOGO, VARIOUS_ARTISTS_FANART
+from music_assistant.constants import CACHE_CATEGORY_MEDIA_INFO, MASS_LOGO, VARIOUS_ARTISTS_FANART
 from music_assistant.helpers.tags import AudioTags, async_parse_tags
 from music_assistant.helpers.uri import parse_uri
 from music_assistant.models.music_provider import MusicProvider
@@ -368,7 +367,7 @@ class BuiltinProvider(MusicProvider):
         if media_type == MediaType.PLAYLIST and prov_item_id in BUILTIN_PLAYLISTS:
             # user wants to disable/remove one of our builtin playlists
             # to prevent it comes back, we mark it as disabled in config
-            self.mass.config.set_raw_provider_config_value(self.instance_id, prov_item_id, False)
+            self.update_config_value(prov_item_id, False)
             return True
         if media_type == MediaType.TRACK:
             # regular manual track URL/path
@@ -534,7 +533,7 @@ class BuiltinProvider(MusicProvider):
 
     async def _get_media_info(self, url: str, force_refresh: bool = False) -> AudioTags:
         """Retrieve mediainfo for url."""
-        cache_category = CacheCategory.MEDIA_INFO
+        cache_category = CACHE_CATEGORY_MEDIA_INFO
         cache_base_key = self.lookup_key
         # do we have some cached info for this url ?
         cached_info = await self.mass.cache.get(

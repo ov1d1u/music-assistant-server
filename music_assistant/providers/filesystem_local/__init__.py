@@ -63,7 +63,12 @@ from music_assistant.helpers.ffmpeg import get_ffmpeg_stream
 from music_assistant.helpers.json import json_loads
 from music_assistant.helpers.playlists import parse_m3u, parse_pls
 from music_assistant.helpers.tags import AudioTags, async_parse_tags, parse_tags, split_items
-from music_assistant.helpers.util import TaskManager, parse_title_and_version, try_parse_int
+from music_assistant.helpers.util import (
+    TaskManager,
+    detect_charset,
+    parse_title_and_version,
+    try_parse_int,
+)
 from music_assistant.models.music_provider import MusicProvider
 
 from .constants import (
@@ -179,6 +184,7 @@ class LocalFileSystemProvider(MusicProvider):
         }
         if self.write_access:
             music_features.add(ProviderFeature.PLAYLIST_TRACKS_EDIT)
+            music_features.add(ProviderFeature.PLAYLIST_CREATE)
         return music_features
 
     @property
@@ -187,10 +193,9 @@ class LocalFileSystemProvider(MusicProvider):
         return False
 
     @property
-    def default_name(self) -> str:
-        """Return default name for this provider instance."""
-        postfix = self.base_path.split(os.sep)[-1]
-        return f"{self.manifest.name} {postfix}"
+    def instance_name_postfix(self) -> str | None:
+        """Return a (default) instance name postfix for this provider instance."""
+        return self.base_path.split(os.sep)[-1]
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
@@ -435,8 +440,6 @@ class LocalFileSystemProvider(MusicProvider):
                     playlist = await self.get_playlist(item.relative_path)
                     # add/update] playlist to db
                     playlist.cache_checksum = item.checksum
-                    # playlist is always favorite
-                    playlist.favorite = True
                     await self.mass.music.playlists.add_item_to_library(
                         playlist,
                         overwrite_existing=prev_checksum is not None,
@@ -635,7 +638,7 @@ class LocalFileSystemProvider(MusicProvider):
 
     async def get_podcast(self, prov_podcast_id: str) -> Podcast:
         """Get full podcast details by id."""
-        for episode in await self.get_podcast_episodes(prov_podcast_id):
+        async for episode in self.get_podcast_episodes(prov_podcast_id):
             assert isinstance(episode.podcast, Podcast)
             return episode.podcast
         msg = f"Podcast not found: {prov_podcast_id}"
@@ -671,8 +674,11 @@ class LocalFileSystemProvider(MusicProvider):
         try:
             # get playlist file contents
             playlist_filename = self.get_absolute_path(prov_playlist_id)
-            async with aiofiles.open(playlist_filename, encoding="utf-8") as _file:
-                playlist_data = await _file.read()
+            async with aiofiles.open(playlist_filename, mode="rb") as _file:
+                playlist_data_raw = await _file.read()
+                encoding = await detect_charset(playlist_data_raw)
+                playlist_data = playlist_data_raw.decode(encoding, errors="replace")
+
             if ext in ("m3u", "m3u8"):
                 playlist_lines = parse_m3u(playlist_data)
             else:
@@ -696,7 +702,9 @@ class LocalFileSystemProvider(MusicProvider):
             )
         return result
 
-    async def get_podcast_episodes(self, prov_podcast_id: str) -> list[PodcastEpisode]:
+    async def get_podcast_episodes(
+        self, prov_podcast_id: str
+    ) -> AsyncGenerator[PodcastEpisode, None]:
         """Get podcast episodes for given podcast id."""
         episodes: list[PodcastEpisode] = []
 
@@ -721,7 +729,8 @@ class LocalFileSystemProvider(MusicProvider):
                     continue
                 tm.create_task(_process_podcast_episode(item))
 
-        return episodes
+        for episode in episodes:
+            yield episode
 
     async def _parse_playlist_line(self, line: str, playlist_path: str) -> Track | None:
         """Try to parse a track from a playlist line."""

@@ -17,19 +17,20 @@ from music_assistant_models.config_entries import (
     ProviderConfig,
 )
 from music_assistant_models.enums import ConfigEntryType, EventType, MediaType, ProviderFeature
-from music_assistant_models.errors import LoginFailed
+from music_assistant_models.errors import LoginFailed, MediaNotFoundError
 
 from music_assistant.models.music_provider import MusicProvider
 from music_assistant.providers.audible.audible_helper import (
     AudibleHelper,
     audible_custom_login,
     audible_get_auth_info,
+    cached_authenticator_from_file,
     check_file_exists,
     remove_file,
 )
 
 if TYPE_CHECKING:
-    from music_assistant_models.media_items import Audiobook
+    from music_assistant_models.media_items import Audiobook, MediaItemType
     from music_assistant_models.provider import ProviderManifest
     from music_assistant_models.streamdetails import StreamDetails
 
@@ -75,11 +76,10 @@ async def get_config_entries(
     locale = cast(str, values.get("locale", "") or "us")
     auth_file = cast(str, values.get(CONF_AUTH_FILE))
 
-    # Check if auth file exists and is valid
     auth_required = True
     if auth_file and await check_file_exists(auth_file):
         try:
-            auth = await asyncio.to_thread(audible.Authenticator.from_file, auth_file)
+            auth = await cached_authenticator_from_file(auth_file)
             auth_required = False
         except Exception:
             auth_required = True
@@ -229,14 +229,26 @@ class Audibleprovider(MusicProvider):
         """Handle asynchronous initialization of the provider."""
         await self._login()
 
+    # Cache for authenticators to avoid repeated file I/O
+    _AUTH_CACHE: dict[str, audible.Authenticator] = {}
+
     async def _login(self) -> None:
         """Authenticate with Audible using the saved authentication file."""
         try:
-            auth = await asyncio.to_thread(audible.Authenticator.from_file, self.auth_file)
+            auth = self._AUTH_CACHE.get(self.instance_id)
+
+            if auth is None:
+                self.logger.debug("Loading authenticator from file")
+                auth = await cached_authenticator_from_file(self.auth_file)
+                self._AUTH_CACHE[self.instance_id] = auth
+            else:
+                self.logger.debug("Using cached authenticator")
 
             if auth.access_token_expired:
+                self.logger.debug("Access token expired, refreshing")
                 await asyncio.to_thread(auth.refresh_access_token)
                 await asyncio.to_thread(auth.to_file, self.auth_file)
+                self._AUTH_CACHE[self.instance_id] = auth
 
             self._client = audible.AsyncClient(auth)
 
@@ -245,6 +257,7 @@ class Audibleprovider(MusicProvider):
                 client=self._client,
                 provider_instance=self.instance_id,
                 provider_domain=self.domain,
+                logger=self.logger,
             )
 
             self.logger.info("Successfully authenticated with Audible.")
@@ -270,21 +283,23 @@ class Audibleprovider(MusicProvider):
 
     async def get_audiobook(self, prov_audiobook_id: str) -> Audiobook:
         """Get full audiobook details by id."""
-        audiobook = await self.helper.get_audiobook(asin=prov_audiobook_id, use_cache=False)
-        if audiobook is None:
-            raise ValueError(f"Audiobook with id {prov_audiobook_id} not found")
-        return audiobook
+        return await self.helper.get_audiobook(asin=prov_audiobook_id, use_cache=False)
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """Get streamdetails for a audiobook based of asin."""
-        return await self.helper.get_stream(asin=item_id)
+        try:
+            return await self.helper.get_stream(asin=item_id)
+        except ValueError as exc:
+            raise MediaNotFoundError(f"Failed to get stream details for {item_id}") from exc
 
     async def on_played(
         self,
         media_type: MediaType,
-        item_id: str,
+        prov_item_id: str,
         fully_played: bool,
         position: int,
+        media_item: MediaItemType,
+        is_playing: bool = False,
     ) -> None:
         """
         Handle callback when a (playable) media item has been played.
@@ -295,11 +310,16 @@ class Audibleprovider(MusicProvider):
             - every 30s when a track is playing
 
         Fully played is True when the track has been played to the end.
+
         Position is the last known position of the track in seconds, to sync resume state.
         When fully_played is set to false and position is 0,
         the user marked the item as unplayed in the UI.
+
+        is_playing is True when the track is currently playing.
+
+        media_item is the full media item details of the played/playing track.
         """
-        await self.helper.set_last_position(item_id, position)
+        await self.helper.set_last_position(prov_item_id, position)
 
     async def unload(self, is_removed: bool = False) -> None:
         """

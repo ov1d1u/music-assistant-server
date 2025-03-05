@@ -8,8 +8,8 @@ the upnp callbacks and json rpc api for slimproto clients.
 
 from __future__ import annotations
 
+import asyncio
 import os
-import time
 import urllib.parse
 from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING
@@ -37,6 +37,7 @@ from music_assistant.constants import (
     CONF_ENTRY_ENABLE_ICY_METADATA,
     CONF_HTTP_PROFILE,
     CONF_OUTPUT_CHANNELS,
+    CONF_OUTPUT_CODEC,
     CONF_PUBLISH_IP,
     CONF_SAMPLE_RATES,
     CONF_VOLUME_NORMALIZATION_FIXED_GAIN_RADIO,
@@ -245,26 +246,39 @@ class StreamsController(CoreController):
         """Cleanup on exit."""
         await self._server.close()
 
-    def resolve_stream_url(
+    async def resolve_stream_url(
         self,
         queue_item: QueueItem,
         flow_mode: bool = False,
-        output_codec: ContentType = ContentType.FLAC,
+        player_id: str | None = None,
     ) -> str:
         """Resolve the stream URL for the given QueueItem."""
+        if not player_id:
+            player_id = queue_item.queue_id
+        output_codec = ContentType.try_parse(
+            await self.mass.config.get_player_config_value(player_id, CONF_OUTPUT_CODEC)
+        )
         fmt = output_codec.value
         # handle raw pcm without exact format specifiers
         if output_codec.is_pcm() and ";" not in fmt:
             fmt += f";codec=pcm;rate={44100};bitrate={16};channels={2}"
-        query_params = {}
         base_path = "flow" if flow_mode else "single"
-        url = f"{self._server.base_url}/{base_path}/{queue_item.queue_id}/{queue_item.queue_item_id}.{fmt}"  # noqa: E501
-        # we add a timestamp as basic checksum
-        # most importantly this is to invalidate any caches
-        # but also to handle edge cases such as single track repeat
-        query_params["ts"] = str(int(time.time()))
-        url += "?" + urllib.parse.urlencode(query_params)
-        return url
+        return f"{self._server.base_url}/{base_path}/{queue_item.queue_id}/{queue_item.queue_item_id}.{fmt}"  # noqa: E501
+
+    async def get_plugin_source_url(
+        self,
+        plugin_source: str,
+        player_id: str,
+    ) -> str:
+        """Get the url for the Plugin Source stream/proxy."""
+        output_codec = ContentType.try_parse(
+            await self.mass.config.get_player_config_value(player_id, CONF_OUTPUT_CODEC)
+        )
+        fmt = output_codec.value
+        # handle raw pcm without exact format specifiers
+        if output_codec.is_pcm() and ";" not in fmt:
+            fmt += f";codec=pcm;rate={44100};bitrate={16};channels={2}"
+        return f"{self._server.base_url}/pluginsource/{plugin_source}/{player_id}.{fmt}"
 
     async def serve_queue_item_stream(self, request: web.Request) -> web.Response:
         """Stream single queueitem audio to a player."""
@@ -325,7 +339,7 @@ class StreamsController(CoreController):
             return resp
 
         # all checks passed, start streaming!
-        self.logger.info(
+        self.logger.debug(
             "Start serving audio stream for QueueItem %s (%s) to %s",
             queue_item.name,
             queue_item.uri,
@@ -344,7 +358,6 @@ class StreamsController(CoreController):
         # inform the queue that the track is now loaded in the buffer
         # so for example the next track can be enqueued
         self.mass.player_queues.track_loaded_in_buffer(queue_id, queue_item_id)
-
         async for chunk in get_ffmpeg_stream(
             audio_input=self.get_queue_item_stream(
                 queue_item=queue_item,
@@ -355,6 +368,7 @@ class StreamsController(CoreController):
             filter_params=get_player_filter_params(
                 self.mass, queue_player.player_id, pcm_format, output_format
             ),
+            chunk_size=get_chunksize(output_format),
         ):
             try:
                 await resp.write(chunk)
@@ -451,7 +465,7 @@ class StreamsController(CoreController):
             filter_params=get_player_filter_params(
                 self.mass, queue_player.player_id, flow_pcm_format, output_format
             ),
-            chunk_size=icy_meta_interval if enable_icy else None,
+            chunk_size=icy_meta_interval if enable_icy else get_chunksize(output_format),
         ):
             try:
                 await resp.write(chunk)
@@ -594,6 +608,7 @@ class StreamsController(CoreController):
             "Accept-Ranges": "none",
             "Content-Type": f"audio/{output_format.output_format_str}",
         }
+
         resp = web.StreamResponse(
             status=200,
             reason="OK",
@@ -616,12 +631,6 @@ class StreamsController(CoreController):
             return resp
 
         # all checks passed, start streaming!
-        self.logger.debug(
-            "Start serving audio stream for PluginSource %s (%s) to %s",
-            plugin_source.name,
-            plugin_source.id,
-            player.display_name,
-        )
         async for chunk in self.get_plugin_source_stream(
             plugin_source_id=plugin_source_id,
             output_format=output_format,
@@ -653,19 +662,6 @@ class StreamsController(CoreController):
         # this ensures playback on all players, including ones that do not
         # like https hosts and it also offers the pre-announce 'bell'
         return f"{self.base_url}/announcement/{player_id}.{content_type.value}?pre_announce={use_pre_announce}"  # noqa: E501
-
-    def get_plugin_source_url(
-        self,
-        plugin_source: str,
-        player_id: str,
-        output_codec: ContentType = ContentType.FLAC,
-    ) -> str:
-        """Get the url for the Plugin Source stream/proxy."""
-        fmt = output_codec.value
-        # handle raw pcm without exact format specifiers
-        if output_codec.is_pcm() and ";" not in fmt:
-            fmt += f";codec=pcm;rate={44100};bitrate={16};channels={2}"
-        return f"{self._server.base_url}/pluginsource/{plugin_source}/{player_id}.{fmt}"
 
     async def get_queue_flow_stream(
         self,
@@ -715,7 +711,7 @@ class StreamsController(CoreController):
                     queue_track.queue_item_id,
                 )
 
-            self.logger.info(
+            self.logger.debug(
                 "Start Streaming queue track: %s (%s) for queue %s",
                 queue_track.streamdetails.uri,
                 queue_track.name,
@@ -869,26 +865,35 @@ class StreamsController(CoreController):
         player = self.mass.players.get(player_id)
         plugin_prov: PluginProvider = self.mass.get_provider(plugin_source_id)
         plugin_source = plugin_prov.get_source()
-        if plugin_prov.in_use_by and plugin_prov.in_use_by != player_id:
+        if plugin_source.in_use_by and plugin_source.in_use_by != player_id:
             raise RuntimeError(
-                f"PluginSource plugin_source.name is already in use by {plugin_prov.in_use_by}"
+                f"PluginSource plugin_source.name is already in use by {plugin_source.in_use_by}"
             )
+        self.logger.debug("Start streaming PluginSource %s to %s", plugin_source_id, player_id)
         audio_input = (
             plugin_prov.get_audio_stream(player_id)
             if plugin_source.stream_type == StreamType.CUSTOM
             else plugin_source.path
         )
-        chunk_size = int(get_chunksize(output_format, 1) / 10)
         player.active_source = plugin_source_id
-        async for chunk in get_ffmpeg_stream(
-            audio_input=audio_input,
-            input_format=plugin_source.audio_format,
-            output_format=output_format,
-            chunk_size=chunk_size,
-            filter_params=player_filter_params,
-            extra_input_args=["-re"],
-        ):
-            yield chunk
+        plugin_source.in_use_by = player_id
+        try:
+            async for chunk in get_ffmpeg_stream(
+                audio_input=audio_input,
+                input_format=plugin_source.audio_format,
+                output_format=output_format,
+                filter_params=player_filter_params,
+                extra_input_args=["-re"],
+                chunk_size=int(get_chunksize(output_format) / 10),
+            ):
+                yield chunk
+        finally:
+            self.logger.debug(
+                "Finished streaming PluginSource %s to %s", plugin_source_id, player_id
+            )
+            await asyncio.sleep(0.5)
+            player.active_source = player.player_id
+            plugin_source.in_use_by = None
 
     async def get_queue_item_stream(
         self,
@@ -899,8 +904,10 @@ class StreamsController(CoreController):
         # collect all arguments for ffmpeg
         streamdetails = queue_item.streamdetails
         assert streamdetails
+        stream_type = streamdetails.stream_type
         filter_params = []
         extra_input_args = streamdetails.extra_input_args or []
+
         # handle volume normalization
         gain_correct: float | None = None
         if streamdetails.volume_normalization_mode == VolumeNormalizationMode.DYNAMIC:
@@ -929,14 +936,14 @@ class StreamsController(CoreController):
         streamdetails.volume_normalization_gain_correct = gain_correct
 
         # work out audio source for these streamdetails
-        if streamdetails.stream_type == StreamType.CUSTOM:
+        if stream_type == StreamType.CUSTOM:
             audio_source = self.mass.get_provider(streamdetails.provider).get_audio_stream(
                 streamdetails,
                 seek_position=streamdetails.seek_position,
             )
-        elif streamdetails.stream_type == StreamType.ICY:
+        elif stream_type == StreamType.ICY:
             audio_source = get_icy_radio_stream(self.mass, streamdetails.path, streamdetails)
-        elif streamdetails.stream_type == StreamType.HLS:
+        elif stream_type == StreamType.HLS:
             substream = await get_hls_substream(self.mass, streamdetails.path)
             audio_source = substream.path
             if streamdetails.media_type == MediaType.RADIO:
@@ -947,10 +954,6 @@ class StreamsController(CoreController):
         else:
             audio_source = streamdetails.path
 
-        # add support for decryption key provided in streamdetails
-        if streamdetails.decryption_key:
-            extra_input_args += ["-decryption_key", streamdetails.decryption_key]
-
         # handle seek support
         if (
             streamdetails.seek_position
@@ -958,7 +961,7 @@ class StreamsController(CoreController):
             and streamdetails.allow_seek
             # allow seeking for custom streams,
             # but only for custom streams that can't seek theirselves
-            and (streamdetails.stream_type != StreamType.CUSTOM or not streamdetails.can_seek)
+            and (stream_type != StreamType.CUSTOM or not streamdetails.can_seek)
         ):
             extra_input_args += ["-ss", str(int(streamdetails.seek_position))]
 
@@ -1015,33 +1018,25 @@ class StreamsController(CoreController):
         supported_bit_depths: tuple[int] = tuple(int(x[1]) for x in supported_rates_conf)
 
         player_max_bit_depth = max(supported_bit_depths)
-        if content_type.is_pcm() or content_type == ContentType.WAV:
-            # parse pcm details from format string
-            output_sample_rate, output_bit_depth, output_channels = parse_pcm_info(
-                output_format_str
-            )
-            if content_type == ContentType.PCM:
-                # resolve generic pcm type
-                content_type = ContentType.from_bit_depth(output_bit_depth)
+        if default_sample_rate in supported_sample_rates:
+            output_sample_rate = default_sample_rate
         else:
-            if default_sample_rate in supported_sample_rates:
-                output_sample_rate = default_sample_rate
-            else:
-                output_sample_rate = max(supported_sample_rates)
-            output_bit_depth = min(default_bit_depth, player_max_bit_depth)
-            output_channels_str = self.mass.config.get_raw_player_config_value(
-                player.player_id, CONF_OUTPUT_CHANNELS, "stereo"
-            )
-            output_channels = 1 if output_channels_str != "stereo" else 2
+            output_sample_rate = max(supported_sample_rates)
+        output_bit_depth = min(default_bit_depth, player_max_bit_depth)
+        output_channels_str = self.mass.config.get_raw_player_config_value(
+            player.player_id, CONF_OUTPUT_CHANNELS, "stereo"
+        )
+        output_channels = 1 if output_channels_str != "stereo" else 2
         if not content_type.is_lossless():
             output_bit_depth = 16
             output_sample_rate = min(48000, output_sample_rate)
+        if output_format_str == "pcm":
+            content_type = ContentType.from_bit_depth(output_bit_depth)
         return AudioFormat(
             content_type=content_type,
             sample_rate=output_sample_rate,
             bit_depth=output_bit_depth,
             channels=output_channels,
-            output_format_str=output_format_str,
         )
 
     async def _select_flow_format(

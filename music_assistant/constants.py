@@ -35,6 +35,7 @@ MASS_LOGO: Final[str] = str(RESOURCES_DIR.joinpath("logo.png"))
 
 
 # config keys
+CONF_ONBOARD_DONE: Final[str] = "onboard_done"
 CONF_SERVER_ID: Final[str] = "server_id"
 CONF_IP_ADDRESS: Final[str] = "ip_address"
 CONF_PORT: Final[str] = "port"
@@ -46,6 +47,7 @@ CONF_USERNAME: Final[str] = "username"
 CONF_PASSWORD: Final[str] = "password"
 CONF_VOLUME_NORMALIZATION: Final[str] = "volume_normalization"
 CONF_VOLUME_NORMALIZATION_TARGET: Final[str] = "volume_normalization_target"
+CONF_OUTPUT_LIMITER: Final[str] = "output_limiter"
 CONF_DEPRECATED_EQ_BASS: Final[str] = "eq_bass"
 CONF_DEPRECATED_EQ_MID: Final[str] = "eq_mid"
 CONF_DEPRECATED_EQ_TREBLE: Final[str] = "eq_treble"
@@ -62,7 +64,6 @@ CONF_AUTO_PLAY: Final[str] = "auto_play"
 CONF_CROSSFADE: Final[str] = "crossfade"
 CONF_GROUP_MEMBERS: Final[str] = "group_members"
 CONF_HIDE_PLAYER: Final[str] = "hide_player"
-CONF_ENFORCE_MP3: Final[str] = "enforce_mp3"
 CONF_SYNC_ADJUST: Final[str] = "sync_adjust"
 CONF_TTS_PRE_ANNOUNCE: Final[str] = "tts_pre_announce"
 CONF_ANNOUNCE_VOLUME_STRATEGY: Final[str] = "announce_volume_strategy"
@@ -82,6 +83,7 @@ CONF_VOLUME_NORMALIZATION_FIXED_GAIN_TRACKS: Final[str] = "volume_normalization_
 CONF_POWER_CONTROL: Final[str] = "power_control"
 CONF_VOLUME_CONTROL: Final[str] = "volume_control"
 CONF_MUTE_CONTROL: Final[str] = "mute_control"
+CONF_OUTPUT_CODEC: Final[str] = "output_codec"
 
 # config default values
 DEFAULT_HOST: Final[str] = "0.0.0.0"
@@ -220,6 +222,15 @@ CONF_ENTRY_VOLUME_NORMALIZATION_TARGET = ConfigEntry(
     category="advanced",
 )
 
+CONF_ENTRY_OUTPUT_LIMITER = ConfigEntry(
+    key=CONF_OUTPUT_LIMITER,
+    type=ConfigEntryType.BOOLEAN,
+    label="Enable limiting to prevent clipping",
+    default_value=True,
+    description="Activates a limiter that prevents audio distortion by making loud peaks quieter.",
+    category="audio",
+)
+
 # These EQ Options are deprecated and will be removed in the future
 # To allow for automatic migration to the new DSP system, they are still included in the config
 CONF_ENTRY_DEPRECATED_EQ_BASS = ConfigEntry(
@@ -294,24 +305,49 @@ CONF_ENTRY_HIDE_PLAYER = ConfigEntry(
     default_value=False,
 )
 
-CONF_ENTRY_ENFORCE_MP3 = ConfigEntry(
-    key=CONF_ENFORCE_MP3,
-    type=ConfigEntryType.BOOLEAN,
-    label="Enforce (lossy) mp3 stream",
-    default_value=False,
-    description="By default, Music Assistant sends lossless, high quality audio "
-    "to all players. Some players can not deal with that and require the stream to be packed "
-    "into a lossy mp3 codec. \n\n "
-    "Only enable when needed. Saves some bandwidth at the cost of audio quality.",
-    category="audio",
+CONF_ENTRY_OUTPUT_CODEC = ConfigEntry(
+    key=CONF_OUTPUT_CODEC,
+    type=ConfigEntryType.STRING,
+    label="Output codec to use for streaming audio to the player",
+    default_value="flac",
+    options=[
+        ConfigValueOption("FLAC (lossless, compressed)", "flac"),
+        ConfigValueOption("MP3 (lossy)", "mp3"),
+        ConfigValueOption("AAC (lossy)", "aac"),
+        ConfigValueOption("WAV (lossless, uncompressed)", "wav"),
+    ],
+    description="Select the codec to use for streaming audio to this player. \n"
+    "By default, Music Assistant sends lossless, high quality audio to all players and prefers "
+    "the FLAC codec because it offers some compression while still remaining lossless \n\n"
+    "Some players however do not support FLAC and require the stream to be packed "
+    "into e.g. a lossy mp3 codec or you like to save some network bandwidth. \n\n "
+    "Choosing a lossy codec saves some bandwidth at the cost of audio quality.",
+    category="advanced",
 )
 
-CONF_ENTRY_ENFORCE_MP3_DEFAULT_ENABLED = ConfigEntry.from_dict(
-    {**CONF_ENTRY_ENFORCE_MP3.to_dict(), "default_value": True}
+CONF_ENTRY_OUTPUT_CODEC_DEFAULT_MP3 = ConfigEntry.from_dict(
+    {**CONF_ENTRY_OUTPUT_CODEC.to_dict(), "default_value": "mp3"}
 )
-CONF_ENTRY_ENFORCE_MP3_HIDDEN = ConfigEntry.from_dict(
-    {**CONF_ENTRY_ENFORCE_MP3.to_dict(), "default_value": True, "hidden": True}
+CONF_ENTRY_OUTPUT_CODEC_ENFORCE_MP3 = ConfigEntry.from_dict(
+    {**CONF_ENTRY_OUTPUT_CODEC.to_dict(), "default_value": "mp3", "hidden": True}
 )
+CONF_ENTRY_OUTPUT_CODEC_HIDDEN = ConfigEntry.from_dict(
+    {**CONF_ENTRY_OUTPUT_CODEC.to_dict(), "hidden": True}
+)
+CONF_ENTRY_OUTPUT_CODEC_ENFORCE_FLAC = ConfigEntry.from_dict(
+    {**CONF_ENTRY_OUTPUT_CODEC.to_dict(), "default_value": "flac", "hidden": True}
+)
+
+
+def create_output_codec_config_entry(
+    hidden: bool = False, default_value: str = "flac"
+) -> ConfigEntry:
+    """Create output codec config entry based on player specific helpers."""
+    conf_entry = ConfigEntry.from_dict(CONF_ENTRY_OUTPUT_CODEC.to_dict())
+    conf_entry.hidden = hidden
+    conf_entry.default_value = default_value
+    return conf_entry
+
 
 CONF_ENTRY_SYNC_ADJUST = ConfigEntry(
     key=CONF_SYNC_ADJUST,
@@ -431,7 +467,7 @@ CONF_ENTRY_SAMPLE_RATES = ConfigEntry(
         ConfigValueOption("384kHz / 16 bits", f"384000{MULTI_VALUE_SPLITTER}16"),
         ConfigValueOption("384kHz / 24 bits", f"384000{MULTI_VALUE_SPLITTER}24"),
     ],
-    default_value=[f"44100{MULTI_VALUE_SPLITTER}16", f"44100{MULTI_VALUE_SPLITTER}24"],
+    default_value=[f"44100{MULTI_VALUE_SPLITTER}16", f"48000{MULTI_VALUE_SPLITTER}16"],
     required=True,
     label="Sample rates supported by this player",
     category="advanced",
@@ -485,6 +521,10 @@ CONF_ENTRY_ENABLE_ICY_METADATA = ConfigEntry(
     "this correctly. If you experience issues with playback, try to disable this setting.",
 )
 
+CONF_ENTRY_ENABLE_ICY_METADATA_HIDDEN = ConfigEntry.from_dict(
+    {**CONF_ENTRY_ENABLE_ICY_METADATA.to_dict(), "hidden": True}
+)
+
 CONF_ENTRY_WARN_PREVIEW = ConfigEntry(
     key="preview_note",
     type=ConfigEntryType.ALERT,
@@ -495,28 +535,44 @@ CONF_ENTRY_WARN_PREVIEW = ConfigEntry(
 
 
 def create_sample_rates_config_entry(
-    max_sample_rate: int,
-    max_bit_depth: int,
+    supported_sample_rates: list[int] | None = None,
+    supported_bit_depths: list[int] | None = None,
+    hidden: bool = False,
+    max_sample_rate: int | None = None,
+    max_bit_depth: int | None = None,
     safe_max_sample_rate: int = 48000,
     safe_max_bit_depth: int = 16,
-    hidden: bool = False,
-    supported_sample_rates: list[int] | None = None,
 ) -> ConfigEntry:
     """Create sample rates config entry based on player specific helpers."""
     assert CONF_ENTRY_SAMPLE_RATES.options
+    final_supported_sample_rates = supported_sample_rates or []
+    final_supported_bit_depths = supported_bit_depths or []
     conf_entry = ConfigEntry.from_dict(CONF_ENTRY_SAMPLE_RATES.to_dict())
     conf_entry.hidden = hidden
     options: list[ConfigValueOption] = []
     default_value: list[str] = []
+
+    if not supported_sample_rates and max_sample_rate is None:
+        supported_sample_rates = [44100]
+    if not supported_bit_depths and max_bit_depth is None:
+        supported_bit_depths = [16]
+
     for option in CONF_ENTRY_SAMPLE_RATES.options:
         option_value = cast(str, option.value)
         sample_rate_str, bit_depth_str = option_value.split(MULTI_VALUE_SPLITTER, 1)
         sample_rate = int(sample_rate_str)
         bit_depth = int(bit_depth_str)
-        if supported_sample_rates and sample_rate not in supported_sample_rates:
+        # if no supported sample rates are defined, we accept all within max_sample_rate
+        if not supported_sample_rates and max_sample_rate and sample_rate <= max_sample_rate:
+            final_supported_sample_rates.append(sample_rate)
+        if not supported_bit_depths and max_bit_depth and bit_depth <= max_bit_depth:
+            final_supported_bit_depths.append(bit_depth)
+
+        if sample_rate not in final_supported_sample_rates:
             continue
-        if sample_rate <= max_sample_rate and bit_depth <= max_bit_depth:
-            options.append(option)
+        if bit_depth not in final_supported_bit_depths:
+            continue
+        options.append(option)
         if sample_rate <= safe_max_sample_rate and bit_depth <= safe_max_bit_depth:
             default_value.append(option_value)
     conf_entry.options = options
@@ -529,12 +585,14 @@ BASE_PLAYER_CONFIG_ENTRIES = (
     CONF_ENTRY_PLAYER_ICON,
     CONF_ENTRY_FLOW_MODE,
     CONF_ENTRY_VOLUME_NORMALIZATION,
+    CONF_ENTRY_OUTPUT_LIMITER,
     CONF_ENTRY_AUTO_PLAY,
     CONF_ENTRY_VOLUME_NORMALIZATION_TARGET,
     CONF_ENTRY_HIDE_PLAYER,
     CONF_ENTRY_TTS_PRE_ANNOUNCE,
     CONF_ENTRY_SAMPLE_RATES,
     CONF_ENTRY_HTTP_PROFILE_FORCED_2,
+    CONF_ENTRY_OUTPUT_CODEC,
 )
 
 
@@ -560,3 +618,21 @@ DEFAULT_PCM_FORMAT = AudioFormat(
     bit_depth=32,
     channels=2,
 )
+
+
+# CACHE categories
+
+CACHE_CATEGORY_DEFAULT: Final[int] = 0
+CACHE_CATEGORY_MUSIC_SEARCH: Final[int] = 1
+CACHE_CATEGORY_MUSIC_ALBUM_TRACKS: Final[int] = 2
+CACHE_CATEGORY_MUSIC_ARTIST_TRACKS: Final[int] = 3
+CACHE_CATEGORY_MUSIC_ARTIST_ALBUMS: Final[int] = 4
+CACHE_CATEGORY_MUSIC_PLAYLIST_TRACKS: Final[int] = 5
+CACHE_CATEGORY_MUSIC_PROVIDER_ITEM: Final[int] = 6
+CACHE_CATEGORY_PLAYER_QUEUE_STATE: Final[int] = 7
+CACHE_CATEGORY_MEDIA_INFO: Final[int] = 8
+CACHE_CATEGORY_LIBRARY_ITEMS: Final[int] = 9
+CACHE_CATEGORY_PLAYERS: Final[int] = 10
+
+# CACHE base keys
+CACHE_KEY_PLAYER_POWER: Final[str] = "player_power"
